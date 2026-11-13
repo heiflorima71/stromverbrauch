@@ -37,7 +37,7 @@ MODBUS_PORT = int(os.environ.get("MODBUS_PORT", "502"))
 MODBUS_UNIT = int(os.environ.get("MODBUS_UNIT", "1"))
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "60"))
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8080"))
-APP_VERSION = os.environ.get("APP_VERSION", "0.1.7")
+APP_VERSION = os.environ.get("APP_VERSION", "0.1.8")
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DB_PATH = os.path.join(DATA_DIR, "energy.db")
 DOUBLE_REG = int(os.environ.get("ENERGY_DOUBLE_REG", "6012"))   # double, 4 regs
@@ -48,6 +48,12 @@ LIMIT_U_MIN = float(os.environ.get("LIMIT_U_MIN", "207"))
 LIMIT_U_MAX = float(os.environ.get("LIMIT_U_MAX", "253"))
 LIMIT_F_MIN = float(os.environ.get("LIMIT_F_MIN", "49.5"))
 LIMIT_F_MAX = float(os.environ.get("LIMIT_F_MAX", "50.5"))
+# Kosten & Standby-Waechter (Nachts: Poolpumpe / Frostschutz Gewaechshaus = Normalbetrieb,
+# daher Standardmaessig DEAKTIVIERT; Alarm erst bei konfigurierter Grenze)
+EUR_PER_KWH = float(os.environ.get("EUR_PER_KWH", "0.35"))
+NIGHT_POWER_LIMIT_W = float(os.environ.get("NIGHT_POWER_LIMIT_W", "0"))  # 0 = aus
+NIGHT_START_HOUR = int(os.environ.get("NIGHT_START_HOUR", "2"))
+NIGHT_END_HOUR = int(os.environ.get("NIGHT_END_HOUR", "5"))
 
 _tid = 0
 _tid_lock = threading.Lock()
@@ -349,6 +355,12 @@ def check_anomalies(q, ts):
         ("Spannung L3-N", q["u3"], LIMIT_U_MIN, LIMIT_U_MAX),
         ("Frequenz", q["f"], LIMIT_F_MIN, LIMIT_F_MAX),
     ]
+    # Standby-Waechter: Leistung in der Nachtstunde ueber Grenzwert (nur wenn aktiviert).
+    # Ausserhalb des Fensters wird ein offenes Event geschlossen (val=0).
+    if NIGHT_POWER_LIMIT_W > 0:
+        hour = datetime.fromtimestamp(ts).hour
+        in_night = NIGHT_START_HOUR <= hour < NIGHT_END_HOUR
+        monitored.append(("Nachtverbrauch (Pumpe?)", q["p"] if in_night else 0.0, 0.0, NIGHT_POWER_LIMIT_W))
     con = db()
     for kind, val, lo, hi in monitored:
         if val is None:
@@ -386,6 +398,163 @@ def quality_snapshot():
                    for e in events],
         "extremes": json.loads(get_meta("device_extremes", "{}")),
     }
+
+
+# ---------------- Leistung (Lastgang) & Heatmap ----------------
+def power_series_24h():
+    """Letzte 24 h aus quality: 48 Halbstunden-Mittel der Wirkleistung (kW)."""
+    now = time.time()
+    start = now - 86400
+    con = db()
+    rows = con.execute("SELECT ts, p FROM quality WHERE ts >= ? AND p IS NOT NULL", (start,)).fetchall()
+    con.close()
+    sums, cnts = [0.0] * 48, [0] * 48
+    for ts, p in rows:
+        i = min(47, max(0, int((ts - start) // 1800)))
+        sums[i] += p
+        cnts[i] += 1
+    vals = [round(sums[i] / cnts[i] / 1000.0, 3) if cnts[i] else None for i in range(48)]
+    labels = [datetime.fromtimestamp(start + i * 1800).strftime("%H:%M") for i in range(48)]
+    return labels, vals
+
+
+def power_stats():
+    """Spitzenleistung (24 h), Grundlast (Nachtminimum 7 Tage), Ø-Leistung (24 h)."""
+    now = time.time()
+    con = db()
+    rows24 = con.execute("SELECT p FROM quality WHERE ts >= ? AND p IS NOT NULL", (now - 86400,)).fetchall()
+    peak = max((p for (p,) in rows24), default=None)
+    avg24 = (sum(p for (p,) in rows24) / len(rows24)) if rows24 else None
+    rows7 = con.execute(
+        "SELECT ts, p FROM quality WHERE ts >= ? AND p IS NOT NULL", (now - 7 * 86400,)).fetchall()
+    con.close()
+    grund, grund_when = None, None
+    by_h = {}
+    for ts, p in rows7:
+        dt = datetime.fromtimestamp(ts)
+        if NIGHT_START_HOUR <= dt.hour < NIGHT_END_HOUR:
+            by_h.setdefault((dt.strftime("%Y-%m-%d"), dt.hour), []).append(p)
+    if by_h:
+        per = {k: sum(v) / len(v) for k, v in by_h.items()}
+        (day, hr), grund = min(per.items(), key=lambda kv: kv[1])
+        grund_when = f"{day} {hr:02d} h"
+    return {"peak": round(peak / 1000.0, 2) if peak is not None else None,
+            "avg24": round(avg24 / 1000.0, 2) if avg24 is not None else None,
+            "grundlast": round(grund / 1000.0, 2) if grund is not None else None,
+            "grundlast_when": grund_when}
+
+
+def svg_power(labels, vals, stats):
+    """Linien-Diagramm der Leistung (kW) ueber die letzten 24 h."""
+    W, H = 920, 360
+    ml, mr, mt, mb = 62, 18, 42, 46
+    pw, ph = W - ml - mr, H - mt - mb
+    pts = [(i, v) for i, v in enumerate(vals) if v is not None]
+    vmax = max([v for _, v in pts] + [1.0]) * 1.15
+
+    def X(i):
+        return ml + (i + 0.5) * pw / 48
+
+    def Y(v):
+        return mt + ph - (v / vmax) * ph
+
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" font-family="system-ui,Segoe UI,Arial" font-size="12">']
+    parts.append(f'<rect width="{W}" height="{H}" fill="#ffffff"/>')
+    parts.append(f'<text x="{ml}" y="24" font-size="16" font-weight="600" fill="#222">Leistung letzte 24 h (kW, Halbstunden-Mittel)</text>')
+    g = 0.0
+    step = vmax / 4
+    while g <= vmax:
+        y = Y(g)
+        parts.append(f'<line x1="{ml}" y1="{y:.1f}" x2="{W - mr}" y2="{y:.1f}" stroke="#e6e6e6"/>')
+        parts.append(f'<text x="{ml - 8}" y="{y + 4:.1f}" text-anchor="end" fill="#666">{g:.1f}</text>')
+        g += step
+    if pts:
+        poly = " ".join(f"{X(i):.1f},{Y(v):.1f}" for i, v in pts)
+        area = f"{X(pts[0][0]):.1f},{mt + ph:.1f} " + poly + f" {X(pts[-1][0]):.1f},{mt + ph:.1f}"
+        parts.append(f'<polygon points="{area}" fill="#2f7ed8" opacity="0.18"/>')
+        parts.append(f'<polyline points="{poly}" fill="none" stroke="#2f7ed8" stroke-width="2"/>')
+        if stats.get("peak") is not None:
+            pi, pv = max(pts, key=lambda t: t[1])
+            parts.append(f'<circle cx="{X(pi):.1f}" cy="{Y(pv):.1f}" r="4" fill="#d33"/>')
+            parts.append(f'<text x="{X(pi):.1f}" y="{Y(pv) - 8:.1f}" text-anchor="middle" fill="#d33" font-size="11">Spitze {pv:.2f}</text>')
+    for i in range(0, 48, 4):
+        parts.append(f'<text x="{X(i):.1f}" y="{mt + ph + 16}" text-anchor="middle" fill="#666" font-size="10">{labels[i]}</text>')
+    note = []
+    if stats.get("avg24") is not None:
+        note.append(f"Ø 24 h: {stats['avg24']} kW")
+    if stats.get("peak") is not None:
+        note.append(f"Spitzenleistung: {stats['peak']} kW")
+    if stats.get("grundlast") is not None:
+        note.append(f"Grundlast {NIGHT_START_HOUR:02d}–{NIGHT_END_HOUR:02d} h (7 T): {stats['grundlast']} kW"
+                    + (f" ({stats['grundlast_when']})" if stats.get("grundlast_when") else ""))
+    parts.append(f'<text x="{ml + pw / 2:.0f}" y="{H - 6}" text-anchor="middle" fill="#888">{" · ".join(note)}</text>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def heatmap_series():
+    """Ø kWh je (Wochentag, Stunde) ueber alle vorhandenen vollen Tage."""
+    con = db()
+    rows = con.execute("SELECT ts, delta_wh FROM readings WHERE delta_wh IS NOT NULL AND delta_wh >= 0").fetchall()
+    con.close()
+    sums, days = {}, set()
+    by_day = {}
+    for ts, d in rows:
+        dt = datetime.fromtimestamp(ts)
+        sums[(dt.weekday(), dt.hour)] = sums.get((dt.weekday(), dt.hour), 0.0) + d / 1000.0
+        by_day.setdefault(dt.date(), set()).add(dt.hour)
+        days.add(dt.date())
+    # Wochentage nur mit Tagen bewerten, die >=20 h Daten haben (volle Tage)
+    good = {d.weekday() for d, hs in by_day.items() if len(hs) >= 20}
+    counts = {}
+    for d in days:
+        if len(by_day[d]) >= 20:
+            counts[d.weekday()] = counts.get(d.weekday(), 0) + 1
+    grid = []
+    for wd in range(7):
+        row = []
+        for h in range(24):
+            n = counts.get(wd, 0)
+            row.append(round(sums.get((wd, h), 0.0) / n, 2) if (wd in good and n) else None)
+        grid.append(row)
+    return grid, counts
+
+
+def svg_heatmap(grid, counts):
+    """Heatmap Wochentag x Stunde: eingefaerbte Zellen (Ø kWh)."""
+    W, H = 920, 340
+    ml, mr, mt, mb = 56, 12, 42, 44
+    pw, ph = W - ml - mr, H - mt - mb
+    cw, ch = pw / 24, ph / 7
+    flat = [v for row in grid for v in row if v is not None]
+    vmax = max(flat) if flat else 1.0
+    names = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+
+    def color(v):
+        t = 0.0 if not vmax else min(1.0, v / vmax)
+        r = int(235 - 200 * t)
+        g = int(240 - 120 * t)
+        b = int(250 - 30 * t)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" font-family="system-ui,Segoe UI,Arial" font-size="12">']
+    parts.append(f'<rect width="{W}" height="{H}" fill="#ffffff"/>')
+    nd = f" (Basis: Ø {min(counts.values()) if counts else 0} volle Tage je Wochentag)" if counts else ""
+    parts.append(f'<text x="{ml}" y="24" font-size="16" font-weight="600" fill="#222">Wann verbraucht das Haus? kWh je Wochentag × Stunde{nd}</text>')
+    if not flat:
+        parts.append(f'<text x="{W / 2:.0f}" y="{H / 2:.0f}" text-anchor="middle" fill="#888">Noch keine vollen Tage (≥20 h) im Datenbestand – die Heatmap wächst mit.</text>')
+    for wd in range(7):
+        parts.append(f'<text x="{ml - 8}" y="{mt + wd * ch + ch / 2 + 4:.1f}" text-anchor="end" fill="#666">{names[wd]}</text>')
+        for h in range(24):
+            v = grid[wd][h]
+            x, y = ml + h * cw, mt + wd * ch
+            fill = color(v) if v is not None else "#f2f2f2"
+            parts.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{cw - 1:.1f}" height="{ch - 1:.1f}" fill="{fill}"/>')
+    for h in range(0, 24, 2):
+        parts.append(f'<text x="{ml + h * cw + cw / 2:.1f}" y="{mt + ph + 16}" text-anchor="middle" fill="#666" font-size="10">{h:02d}</text>')
+    parts.append(f'<text x="{ml + pw / 2:.0f}" y="{H - 6}" text-anchor="middle" fill="#888">Dunkelblau = hoher Verbrauch · Nachtspitzen können Poolpumpe/Gewächshaus (Frostschutz) sein</text>')
+    parts.append("</svg>")
+    return "".join(parts)
 
 
 # ---------------- Aggregation ----------------
@@ -459,6 +628,29 @@ def period_series(period, year=None):
         "monat": round(monthly.get(cur_ym, live_month.get(cur_ym, 0.0)), 2),
         "jahr": round(year_card, 2),
     }
+    # Prognose (Hochrechnung laufendes Jahr)
+    doy = now.timetuple().tm_yday
+    if doy > 0 and year_card > 0:
+        cards["prognose"] = round(year_card / doy * 365, 1)
+    # Kosten (EUR) je Kennzahl
+    if EUR_PER_KWH > 0:
+        cards["eur_per_kwh"] = EUR_PER_KWH
+        cards["eur_tag"] = round(cards["tag"] * EUR_PER_KWH, 2)
+        cards["eur_woche"] = round(cards["woche"] * EUR_PER_KWH, 2)
+        cards["eur_monat"] = round(cards["monat"] * EUR_PER_KWH, 2)
+        cards["eur_jahr"] = round(cards["jahr"] * EUR_PER_KWH, 2)
+        if "prognose" in cards:
+            cards["eur_prognose"] = round(cards["prognose"] * EUR_PER_KWH, 2)
+    # Vergleich Vorjahr bei Monatsansicht (labels-aligned, leer wenn nicht vorhanden)
+    if period == "month":
+        yy = int(year) if year else now.year
+        prev = []
+        for m in range(1, 13):
+            k = f"{yy - 1}-{m:02d}"
+            v = monthly.get(k, live_month.get(k, 0.0))
+            prev.append(round(v, 2) if v > 0 else None)
+        cards["prev_year"] = yy - 1
+        cards["prev_values"] = prev
     return labels, values, cards
 
 
@@ -547,7 +739,7 @@ def svg_day_profile(cur, yv, avg, ndays, avg_days):
     return "".join(parts)
 
 
-def svg_chart(period, labels, values, year=None):
+def svg_chart(period, labels, values, year=None, prev_values=None, prev_year=None):
     """Serverseitig gerendertes Balkendiagramm (SVG, keine JS-Libs)."""
     titles = {"day": "Stromverbrauch je Tag (kWh)", "week": "Stromverbrauch je Woche (kWh)",
               "month": f"Stromverbrauch je Monat {year or datetime.now().year} (kWh)",
@@ -555,7 +747,8 @@ def svg_chart(period, labels, values, year=None):
     W, H = 920, 360
     ml, mr, mt, mb = 62, 18, 42, 54
     pw, ph = W - ml - mr, H - mt - mb
-    vmax = max(values) if values else 1.0
+    all_vals = list(values) + [v for v in (prev_values or []) if v]
+    vmax = max(all_vals) if all_vals else 1.0
     vmax = max(vmax * 1.15, 1.0)
 
     def nice_step(x):
@@ -568,7 +761,15 @@ def svg_chart(period, labels, values, year=None):
     step = nice_step(vmax / 4)
     parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" font-family="system-ui,Segoe UI,Arial" font-size="12">']
     parts.append(f'<rect width="{W}" height="{H}" fill="#ffffff"/>')
-    parts.append(f'<text x="{ml}" y="24" font-size="16" font-weight="600" fill="#222">{html.escape(titles[period])}</text>')
+    title = html.escape(titles[period])
+    if prev_values and prev_year:
+        title += f" · Vergleich {prev_year}"
+    parts.append(f'<text x="{ml}" y="24" font-size="16" font-weight="600" fill="#222">{title}</text>')
+    if prev_values and prev_year:
+        parts.append(f'<rect x="{W - 250}" y="14" width="10" height="10" fill="#2f7ed8"/>'
+                     f'<text x="{W - 236}" y="23" fill="#444">{year}</text>')
+        parts.append(f'<rect x="{W - 180}" y="14" width="10" height="10" fill="#c8ccd2"/>'
+                     f'<text x="{W - 166}" y="23" fill="#444">{prev_year}</text>')
 
     # Gitternetz + Y-Achse
     g = 0.0
@@ -581,17 +782,26 @@ def svg_chart(period, labels, values, year=None):
     n = len(values)
     if n:
         bw = pw / n
-        bar_w = max(10, bw * 0.62)
+        paired = bool(prev_values)
+        bar_w = max(10, bw * (0.30 if paired else 0.62))
         for i, v in enumerate(values):
-            x = ml + i * bw + (bw - bar_w) / 2
+            cx = ml + i * bw + bw / 2
+            x = cx - bar_w - 1 if paired else cx - bar_w / 2
             hgt = (v / vmax) * ph
             y = mt + ph - hgt
             parts.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_w:.1f}" height="{hgt:.1f}" rx="3" fill="#2f7ed8"/>')
             parts.append(f'<text x="{x + bar_w / 2:.1f}" y="{y - 5:.1f}" text-anchor="middle" fill="#333" font-size="10">{v:g}</text>')
+            if paired:
+                pv = prev_values[i] if i < len(prev_values) else None
+                if pv:
+                    xp = cx + 1
+                    hp = (pv / vmax) * ph
+                    yp = mt + ph - hp
+                    parts.append(f'<rect x="{xp:.1f}" y="{yp:.1f}" width="{bar_w:.1f}" height="{hp:.1f}" rx="3" fill="#c8ccd2"/>')
             # X-Labels (bei vielen Balken ausduennen)
             skip = max(1, n // 14)
             if i % skip == 0:
-                parts.append(f'<text x="{x + bar_w / 2:.1f}" y="{mt + ph + 16}" text-anchor="middle" fill="#666" font-size="10" transform="rotate(30 {x + bar_w / 2:.1f} {mt + ph + 16})">{html.escape(labels[i])}</text>')
+                parts.append(f'<text x="{cx:.1f}" y="{mt + ph + 16}" text-anchor="middle" fill="#666" font-size="10" transform="rotate(30 {cx:.1f} {mt + ph + 16})">{html.escape(labels[i])}</text>')
     parts.append(f'<text x="{ml + pw / 2:.0f}" y="{H - 6}" text-anchor="middle" fill="#888">kWh in lokaler Zeitzone</text>')
     parts.append("</svg>")
     return "".join(parts)
@@ -608,9 +818,10 @@ PAGE = """<!doctype html>
  .wrap{max-width:980px;margin:0 auto;padding:24px 16px}
  h1{font-size:22px;margin:0 0 4px}
  .sub{color:#777;font-size:13px;margin-bottom:18px}
- .cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:18px}
+ .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:18px}
  .card{background:#fff;border-radius:10px;padding:14px 16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
  .card .v{font-size:22px;font-weight:700}
+ .card .eu{font-size:12px;color:#0a7a2a;margin-top:2px}
  .card .l{font-size:12px;color:#777}
  .panel{background:#fff;border-radius:10px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
  select{font-size:15px;padding:6px 10px;border-radius:8px;border:1px solid #ccc}
@@ -624,10 +835,11 @@ PAGE = """<!doctype html>
  <h1>&#9889; Stromverbrauch</h1>
  <div class="sub">Janitza UMG 96-PQ-L &middot; Modbus TCP &middot; Datenpunkt alle 60&nbsp;s &middot; App-Version <b>__VERSION__</b></div>
  <div class="cards">
-  <div class="card"><div class="v" id="c-tag">–</div><div class="l">Heute (kWh)</div></div>
-  <div class="card"><div class="v" id="c-woche">–</div><div class="l">Diese Woche (kWh)</div></div>
-  <div class="card"><div class="v" id="c-monat">–</div><div class="l">Dieser Monat (kWh)</div></div>
-  <div class="card"><div class="v" id="c-jahr">–</div><div class="l">Dieses Jahr (kWh)</div></div>
+  <div class="card"><div class="v" id="c-tag">–</div><div class="eu" id="c-tag-eu"></div><div class="l">Heute (kWh)</div></div>
+  <div class="card"><div class="v" id="c-woche">–</div><div class="eu" id="c-woche-eu"></div><div class="l">Diese Woche (kWh)</div></div>
+  <div class="card"><div class="v" id="c-monat">–</div><div class="eu" id="c-monat-eu"></div><div class="l">Dieser Monat (kWh)</div></div>
+  <div class="card"><div class="v" id="c-jahr">–</div><div class="eu" id="c-jahr-eu"></div><div class="l">Dieses Jahr (kWh)</div></div>
+  <div class="card" id="c-prog" style="display:none"><div class="v" id="c-prognose">–</div><div class="eu" id="c-prog-eu"></div><div class="l" id="c-prog-l">Prognose (kWh)</div></div>
  </div>
  <div class="panel">
   <div class="row">
@@ -638,6 +850,8 @@ PAGE = """<!doctype html>
     <option value="month">Monat</option>
     <option value="year">Jahr (alle Jahre)</option>
     <option value="profile">Tagesverlauf (Stunden)</option>
+    <option value="power">Leistung (24 h)</option>
+    <option value="heatmap">Heatmap (Woche × Stunde)</option>
    </select>
    <label for="y" id="yl" style="display:none"><b>Jahr:</b></label>
    <select id="y" onchange="load()" style="display:none"></select>
@@ -704,8 +918,9 @@ function loadQuality(){
   if(!tb.innerHTML) tb.innerHTML='<tr><td colspan=6 style="color:#777">Keine Vorkommnisse – Netz im Grenzbereich (seit App-Start)</td></tr>';
  });
 }
-window.ULOX=207; window.UHI=253; window.FLOX=49.5; window.FHI=50.5;
-fetch('/api/envlimits').then(r=>r.json()).then(x=>{window.ULOX=x.u_min;window.UHI=x.u_max;window.FLOX=x.f_min;window.FHI=x.f_max;}).catch(()=>{});
+window.ULOX=207; window.UHI=253; window.FLOX=49.5; window.FHI=50.5; window.NIGHTL=0; window.NS=2; window.NE=5;
+function pwpeak(pw){return pw.peak!=null?(pw.peak+' kW ('+(pw.avg24!=null?('Ø 24 h '+pw.avg24+' kW'):'–')+')'):'–';}
+fetch('/api/envlimits').then(r=>r.json()).then(x=>{window.ULOX=x.u_min;window.UHI=x.u_max;window.FLOX=x.f_min;window.FHI=x.f_max;window.NIGHTL=x.night_limit_w;window.NS=x.night_start;window.NE=x.night_end;}).catch(()=>{});
 function onPeriod(){
   var p=document.getElementById('p').value;
   document.getElementById('yl').style.display=(p==='month')?'inline':'none';
@@ -726,8 +941,22 @@ function load(){
     document.getElementById('c-woche').textContent=(c.woche!=null?c.woche:'–');
     document.getElementById('c-monat').textContent=(c.monat!=null?c.monat:'–');
     document.getElementById('c-jahr').textContent=(c.jahr!=null?c.jahr:'–');
+    function eu(id,v){document.getElementById(id).textContent=(v!=null)?('≈ '+v.toLocaleString('de-DE',{minimumFractionDigits:2,maximumFractionDigits:2})+' €'):'';}
+    eu('c-tag-eu',c.eur_tag); eu('c-woche-eu',c.eur_woche); eu('c-monat-eu',c.eur_monat); eu('c-jahr-eu',c.eur_jahr);
+    if(c.prognose!=null){
+      document.getElementById('c-prog').style.display='block';
+      document.getElementById('c-prognose').textContent=c.prognose;
+      document.getElementById('c-prog-l').textContent='Prognose '+new Date().getFullYear()+' (kWh)';
+      eu('c-prog-eu',c.eur_prognose);
+    } else { document.getElementById('c-prog').style.display='none'; }
     var st='Datenstand: '+(s.last_ok?('Zeitstempel '+s.last_ok):'noch kein Messpunkt')+
            (s.source?(' &middot; Quelle '+s.source):'');
+    if(p==='power'&&s.power){
+      var pw=s.power;
+      st+='<br>Spitzenleistung '+(pwpeak(pw))+ ' · Grundlast (7 T, nachts) '+(pw.grundlast!=null?pw.grundlast+' kW':'–')+
+          (pw.grundlast_when?(' am '+pw.grundlast_when):'')+
+          ' · <span style="color:#888">Standby-Wächter: '+(window.NIGHTL>0?('Grenze '+window.NIGHTL+' W ('+window.NS+'–'+window.NE+' h)'):'aus (Poolpumpe/Frostschutz = Normalbetrieb)')+'</span>';
+    }
     if(s.last_error) st+=' &middot; <span class=err>letzter Fehler: '+s.last_error+'</span>';
     document.getElementById('status').innerHTML=st;
   });
@@ -774,8 +1003,19 @@ class Handler(BaseHTTPRequestHandler):
                     cur, yv, avg, n = day_profile(nd)
                     self._send(200, "image/svg+xml; charset=utf-8", svg_day_profile(cur, yv, avg, n, nd))
                     return
-                labels, values, _ = period_series(p, yr)
-                self._send(200, "image/svg+xml; charset=utf-8", svg_chart(p, labels, values, yr))
+                if p == "power":
+                    labels, vals = power_series_24h()
+                    self._send(200, "image/svg+xml; charset=utf-8", svg_power(labels, vals, power_stats()))
+                    return
+                if p == "heatmap":
+                    grid, counts = heatmap_series()
+                    self._send(200, "image/svg+xml; charset=utf-8", svg_heatmap(grid, counts))
+                    return
+                labels, values, cards = period_series(p, yr)
+                self._send(200, "image/svg+xml; charset=utf-8",
+                           svg_chart(p, labels, values, yr,
+                                     cards.get("prev_values") if p == "month" else None,
+                                     cards.get("prev_year") if p == "month" else None))
             elif u.path == "/api/years":
                 self._send(200, "application/json", json.dumps(available_years()))
             elif u.path == "/api/quality":
@@ -783,7 +1023,10 @@ class Handler(BaseHTTPRequestHandler):
             elif u.path == "/api/envlimits":
                 self._send(200, "application/json", json.dumps(
                     {"u_min": LIMIT_U_MIN, "u_max": LIMIT_U_MAX,
-                     "f_min": LIMIT_F_MIN, "f_max": LIMIT_F_MAX}))
+                     "f_min": LIMIT_F_MIN, "f_max": LIMIT_F_MAX,
+                     "night_limit_w": NIGHT_POWER_LIMIT_W,
+                     "night_start": NIGHT_START_HOUR, "night_end": NIGHT_END_HOUR,
+                     "eur_per_kwh": EUR_PER_KWH}))
             elif u.path == "/api/status":
                 p = q.get("period", ["day"])[0]
                 _, _, cards = period_series(p, q.get("year", [None])[0])
@@ -794,6 +1037,8 @@ class Handler(BaseHTTPRequestHandler):
                     "source": get_meta("source"),
                     "last_error": get_meta("last_error"),
                 }
+                if p == "power":
+                    payload["power"] = power_stats()
                 self._send(200, "application/json", json.dumps(payload))
             elif u.path == "/api/data":
                 p = q.get("period", ["day"])[0]
