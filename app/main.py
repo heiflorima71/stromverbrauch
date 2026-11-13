@@ -132,6 +132,12 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_readings_ts ON readings(ts);
         CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+        CREATE TABLE IF NOT EXISTS monthly_wh(
+            ym TEXT PRIMARY KEY,          -- 'YYYY-MM'
+            wh REAL NOT NULL,             -- Monatsverbrauch laut Geraetespeicher (Wh)
+            source TEXT,
+            updated REAL
+        );
         """
     )
     con.commit()
@@ -198,6 +204,62 @@ def collector_loop():
         time.sleep(max(10, POLL_SECONDS))
 
 
+# ---------------- Monats-Historie aus Geraetespeicher (Backfill) ----------------
+# Offizieller Janitza-Monatsspeicher "active energy (consumed), max. monthly value":
+# Double 6248.. (gerades Jahr) / 6296.. (ungerades Jahr), Fallback Float 5124/5148.
+def read_double_block(addr, n):
+    regs = modbus_read(MODBUS_HOST, MODBUS_PORT, MODBUS_UNIT, addr, 4 * n)
+    return [struct.unpack(">d", struct.pack(">4H", *regs[4 * i:4 * i + 4]))[0] for i in range(n)]
+
+
+def read_float_block(addr, n):
+    regs = modbus_read(MODBUS_HOST, MODBUS_PORT, MODBUS_UNIT, addr, 2 * n)
+    return [struct.unpack(">f", struct.pack(">2H", regs[2 * i], regs[2 * i + 1]))[0] for i in range(n)]
+
+
+def monthly_backfill_once():
+    """Liest den 24-Monats-Speicher und schreibt ihn in die DB.
+    Zyklus-Regel: im geraden Jahr = (gerade=tz. Jahr, ungerade=Vorjahr),
+    im ungeraden Jahr = (ungerade=tz. Jahr, gerade=Vorjahr).
+    Der laufende Monat wird uebersprungen (laeuft live weiter)."""
+    y = datetime.now().year
+    if y % 2 == 0:
+        even_year, odd_year = y, y - 1
+    else:
+        odd_year, even_year = y, y - 1
+    try:
+        ev, od, src = read_double_block(6248, 12), read_double_block(6296, 12), "monthly:double"
+    except RuntimeError:
+        ev, od, src = read_float_block(5124, 12), read_float_block(5148, 12), "monthly:float"
+    now = time.time()
+    cur_ym = datetime.now().strftime("%Y-%m")
+    n = 0
+    con = db()
+    for m in range(12):
+        for year, wh in ((even_year, ev[m]), (odd_year, od[m])):
+            ym = f"{year}-{m + 1:02d}"
+            if wh and wh > 0 and ym != cur_ym and ym <= cur_ym:
+                con.execute(
+                    "INSERT INTO monthly_wh(ym, wh, source, updated) VALUES(?,?,?,?) "
+                    "ON CONFLICT(ym) DO UPDATE SET wh=excluded.wh, source=excluded.source, updated=excluded.updated",
+                    (ym, wh, src, now),
+                )
+                n += 1
+    con.commit()
+    con.close()
+    print(f"{datetime.now().isoformat(timespec='seconds')} monthly backfill: {n} Monate importiert ({src}, Jahre {even_year}/{odd_year})", flush=True)
+    set_meta("monthly_backfill_at", str(int(now)))
+
+
+def monthly_backfill_loop():
+    while True:
+        try:
+            monthly_backfill_once()
+        except Exception as e:
+            print(f"{datetime.now().isoformat(timespec='seconds')} monthly backfill FEHLER: {type(e).__name__}: {e}", flush=True)
+        time.sleep(12 * 3600)
+
+
 # ---------------- Aggregation ----------------
 def period_series(period):
     """
@@ -225,6 +287,18 @@ def period_series(period):
         else:  # year
             key = dt.strftime("%Y")
         buckets[key] = buckets.get(key, 0.0) + delta / 1000.0
+
+    # Geraetespeicher (Monatsregister) fuer abgeschlossene Monate/Jahre ergaenzen:
+    con = db()
+    cur_ym = datetime.now().strftime("%Y-%m")
+    cur_year = datetime.now().strftime("%Y")
+    for ym, wh in con.execute("SELECT ym, wh FROM monthly_wh").fetchall():
+        if period == "month" and ym != cur_ym:
+            buckets[ym] = wh / 1000.0
+        elif period == "year" and ym != cur_ym:
+            # abgeschlossene Monate des Geraetespeichers (lfd. Monat laeuft live)
+            buckets[ym[:4]] = buckets.get(ym[:4], 0.0) + wh / 1000.0
+    con.close()
 
     keys = sorted(buckets.keys())
     if period == "day":
@@ -427,6 +501,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     init_db()
     threading.Thread(target=collector_loop, daemon=True).start()
+    threading.Thread(target=monthly_backfill_loop, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler)
     print(f"Stromverbrauch-App: Port {LISTEN_PORT}, Modbus {MODBUS_HOST}:{MODBUS_PORT} Unit {MODBUS_UNIT}, Poll {POLL_SECONDS}s, DB {DB_PATH}", flush=True)
     srv.serve_forever()
