@@ -189,9 +189,12 @@ def collector_loop():
             set_meta("last_ok", str(int(now)))
             set_meta("source", source)
             set_meta("last_error", "")
+            print(f"{datetime.now().isoformat(timespec='seconds')} poll ok: {wh/1000:.3f} kWh gesamt, "
+                  f"Delta {(delta or 0)/1000:.4f} kWh, Quelle {source}", flush=True)
         except Exception as e:  # Netzwerk/Modbus-Fehler: Protokoll + Retry
             err = f"{type(e).__name__}: {e}"
             set_meta("last_error", f"{datetime.now(timezone.utc).isoformat()} {err}")
+            print(f"{datetime.now().isoformat(timespec='seconds')} poll FEHLER: {err}", flush=True)
         time.sleep(max(10, POLL_SECONDS))
 
 
