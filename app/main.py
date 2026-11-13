@@ -628,23 +628,20 @@ def svg_heatmap(grid, counts, dark=False):
 
 # ---------------- Wettervergleich: Diagramm ----------------
 def weather_series(days=90):
-    """Letzte N Tage: taeglicher kWh (live) + Temperatur (weather-Tabelle)."""
+    """Letzte N Wettertage: Tagesmittel-Temperatur + Tages-kWh (Balken nur, wo
+    Verbrauchsdaten existieren – die App sammelt live ab ihrem Start)."""
     from datetime import timedelta
     con = db()
     rows = con.execute("SELECT ts, delta_wh FROM readings WHERE delta_wh IS NOT NULL AND delta_wh >= 0").fetchall()
-    wx = {ymd: (tmin, tmean, tmax) for ymd, tmin, tmean, tmax in
-          con.execute("SELECT ymd, tmin, tmean, tmax FROM weather").fetchall()}
+    wx = con.execute("SELECT ymd, tmean, tmin FROM weather ORDER BY ymd").fetchall()
     con.close()
     per_day = {}
     for ts, d in rows:
         k = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
         per_day[k] = per_day.get(k, 0.0) + d / 1000.0
-    start = datetime.now() - timedelta(days=days)
-    out = []
-    for k in sorted(per_day.keys()):
-        if k >= start.strftime("%Y-%m-%d") and k in wx:
-            out.append((k, round(per_day[k], 2), wx[k][1], wx[k][0]))
-    return out
+    start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    return [(ymd, round(per_day[ymd], 2) if ymd in per_day else None, tmean, tmin)
+            for ymd, tmean, tmin in wx if ymd >= start]
 
 
 def svg_weather(series, dark=False):
@@ -661,8 +658,8 @@ def svg_weather(series, dark=False):
         parts.append(f'<text x="{W / 2:.0f}" y="{H / 2:.0f}" text-anchor="middle" fill="{th["sub"]}">{cfg}</text>')
         parts.append("</svg>")
         return "".join(parts)
-    parts.append(f'<text x="{ml}" y="24" font-size="16" font-weight="600" fill="{th["title"]}">Verbrauch vs. Außentemperatur (Balken kWh · Linie Ø-Temperatur °C)</text>')
-    kwh_vals = [v for _, v, _, _ in series]
+    parts.append(f'<text x="{ml}" y="24" font-size="16" font-weight="600" fill="{th["title"]}">Verbrauch vs. Außentemperatur, 90 Tage (Balken kWh · Linie Ø-Temperatur °C)</text>')
+    kwh_vals = [v for _, v, _, _ in series if v is not None]
     t_vals = [t for _, _, t, _ in series if t is not None]
     kmax = max(kwh_vals + [1.0]) * 1.2
     tmin = min(t_vals + [0.0]); tmax = max(t_vals + [1.0])
@@ -693,18 +690,21 @@ def svg_weather(series, dark=False):
     bar_w = max(4, bw * 0.6)
     pts = []
     hdd = 0.0
+    ndays_kwh = 0
     for i, (ymd, kwh, tmean, tmin_d) in enumerate(series):
-        x = ml + i * bw + (bw - bar_w) / 2
-        parts.append(f'<rect x="{x:.1f}" y="{Yk(kwh):.1f}" width="{bar_w:.1f}" height="{mt + ph - Yk(kwh):.1f}" rx="2" fill="{th["bar"]}"/>')
+        cx = ml + i * bw + bw / 2
+        if kwh:
+            ndays_kwh += 1
+            x = cx - bar_w / 2
+            parts.append(f'<rect x="{x:.1f}" y="{Yk(kwh):.1f}" width="{bar_w:.1f}" height="{mt + ph - Yk(kwh):.1f}" rx="2" fill="{th["bar"]}"/>')
         if tmean is not None:
-            pts.append(f"{ml + i * bw + bw / 2:.1f},{Yt(tmean):.1f}")
-        hdd += max(0.0, 18.0 - tmean)
+            pts.append(f"{cx:.1f},{Yt(tmean):.1f}")
+            hdd += max(0.0, 18.0 - tmean)
         if i % max(1, n // 12) == 0:
-            cx = ml + i * bw + bw / 2
             parts.append(f'<text x="{cx:.1f}" y="{mt + ph + 16}" text-anchor="middle" fill="{th["txt"]}" font-size="9" transform="rotate(30 {cx:.1f} {mt + ph + 16})">{ymd[8:10]}.{ymd[5:7]}.</text>')
     if len(pts) > 1:
         parts.append(f'<polyline points="{" ".join(pts)}" fill="none" stroke="#e8820c" stroke-width="2.5"/>')
-    parts.append(f'<text x="{ml + pw / 2:.0f}" y="{H - 6}" text-anchor="middle" fill="{th["sub"]}">{n} Tage · Heizgradtage (18-°C-Basis): {hdd:.0f} · Quelle: Open-Meteo (nur abgefragt, nichts übermittelt)</text>')
+    parts.append(f'<text x="{ml + pw / 2:.0f}" y="{H - 6}" text-anchor="middle" fill="{th["sub"]}">{n} Tage Temperatur · {ndays_kwh} Tage mit Verbrauchsbalken (Balken erst ab App-Start) · Heizgradtage (18-°C-Basis): {hdd:.0f} · Quelle: Open-Meteo</text>')
     parts.append("</svg>")
     return "".join(parts)
 
@@ -968,34 +968,28 @@ PAGE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Stromverbrauch — UMG 96-PQ-L</title>
 <style>
- body{font-family:system-ui,Segoe UI,Arial,sans-serif;background:#f5f6f8;color:#222;margin:0}
+ :root{--bg:#f5f6f8;--fg:#222;--card:#fff;--muted:#777;--sel-bg:#fff;--sel-fg:#222;--sel-bd:#ccc;--th:#777;--b1:#ddd;--b2:#eee;--eu:#0a7a2a;--err:#b00;--ok:#2a8620;--bad:#b00;--sh:0 1px 3px rgba(0,0,0,.08)}
+ body.dark{--bg:#0f1115;--fg:#d5d9e0;--card:#1b1e24;--muted:#8a8f99;--sel-bg:#22262d;--sel-fg:#d5d9e0;--sel-bd:#3a3f47;--th:#8a8f99;--b1:#3a3f47;--b2:#2a2d34;--eu:#5cc46a;--err:#ff7a6e;--ok:#4caf50;--bad:#ff7a6e;--sh:0 1px 3px rgba(0,0,0,.5)}
+ body.light{--bg:#f5f6f8;--fg:#222;--card:#fff;--muted:#777;--sel-bg:#fff;--sel-fg:#222;--sel-bd:#ccc;--th:#777;--b1:#ddd;--b2:#eee;--eu:#0a7a2a;--err:#b00;--ok:#2a8620;--bad:#b00;--sh:0 1px 3px rgba(0,0,0,.08)}
+ @media(prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#d5d9e0;--card:#1b1e24;--muted:#8a8f99;--sel-bg:#22262d;--sel-fg:#d5d9e0;--sel-bd:#3a3f47;--th:#8a8f99;--b1:#3a3f47;--b2:#2a2d34;--eu:#5cc46a;--err:#ff7a6e;--ok:#4caf50;--bad:#ff7a6e;--sh:0 1px 3px rgba(0,0,0,.5)}}
+ body{font-family:system-ui,Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--fg);margin:0}
  .wrap{max-width:980px;margin:0 auto;padding:24px 16px}
  h1{font-size:22px;margin:0 0 4px}
- .sub{color:#777;font-size:13px;margin-bottom:18px}
+ .sub{color:var(--muted);font-size:13px;margin-bottom:18px}
  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:18px}
- .card{background:#fff;border-radius:10px;padding:14px 16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+ .card{background:var(--card);border-radius:10px;padding:14px 16px;box-shadow:var(--sh)}
  .card .v{font-size:22px;font-weight:700}
- .card .eu{font-size:12px;color:#0a7a2a;margin-top:2px}
- .card .l{font-size:12px;color:#777}
- .panel{background:#fff;border-radius:10px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
- select{font-size:15px;padding:6px 10px;border-radius:8px;border:1px solid #ccc}
+ .card .eu{font-size:12px;color:var(--eu);margin-top:2px}
+ .card .l{font-size:12px;color:var(--muted)}
+ .panel{background:var(--card);border-radius:10px;padding:16px;box-shadow:var(--sh)}
+ select{font-size:15px;padding:6px 10px;border-radius:8px;border:1px solid var(--sel-bd);background:var(--sel-bg);color:var(--sel-fg)}
  .row{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px}
  img{width:100%;height:auto}
- .status{font-size:12px;color:#777;margin-top:10px}
- .err{color:#b00}
+ .status{font-size:12px;color:var(--muted);margin-top:10px}
+ .err{color:var(--err)}
+ .ok{color:var(--ok)}
+ .open,.bad{color:var(--bad)}
  @media(max-width:640px){.cards{grid-template-columns:repeat(2,1fr)}}
- @media(prefers-color-scheme:dark){
-  body{background:#0f1115;color:#d5d9e0}
-  .card,.panel{background:#1b1e24;box-shadow:0 1px 3px rgba(0,0,0,.5)}
-  .sub,.status,.card .l{color:#8a8f99}
-  select{background:#22262d;color:#d5d9e0;border-color:#3a3f47}
-  table.ev th{color:#8a8f99;border-bottom-color:#3a3f47}
-  table.ev td{border-bottom-color:#2a2d34}
-  .card .eu{color:#5cc46a}
-  .err{color:#ff7a6e}
-  .ok{color:#4caf50}
-  .open,.bad{color:#ff7a6e}
- }
 </style></head>
 <body><div class="wrap">
  <h1>&#9889; Stromverbrauch</h1>
@@ -1019,6 +1013,12 @@ PAGE = """<!doctype html>
     <option value="power">Leistung (24 h)</option>
     <option value="heatmap">Heatmap (Woche × Stunde)</option>
     <option value="weather">Wettervergleich (Tag)</option>
+   </select>
+   <label for="theme"><b>Theme:</b></label>
+   <select id="theme" onchange="setTheme(this.value)">
+    <option value="auto" selected>Auto</option>
+    <option value="dark">Dunkel</option>
+    <option value="light">Hell</option>
    </select>
    <label for="y" id="yl" style="display:none"><b>Jahr:</b></label>
    <select id="y" onchange="load()" style="display:none"></select>
@@ -1050,11 +1050,8 @@ PAGE = """<!doctype html>
 </div>
 <style>
  table.ev{width:100%;border-collapse:collapse;font-size:12px;margin-top:10px}
- table.ev th{color:#777;text-align:left;font-weight:600;padding:4px 6px;border-bottom:1px solid #ddd}
- table.ev td{padding:4px 6px;border-bottom:1px solid #eee}
- .open{color:#b00;font-weight:700}
- .ok{color:#2a8620}
- .bad{color:#b00}
+ table.ev th{color:var(--th);text-align:left;font-weight:600;padding:4px 6px;border-bottom:1px solid var(--b1)}
+ table.ev td{padding:4px 6px;border-bottom:1px solid var(--b2)}
 </style>
 <script>
 function fmtTs(t){var d=new Date(t*1000);return d.toLocaleString('de-DE',{day:'2-digit',month:'2-digit',year:'2-digit',hour:'2-digit',minute:'2-digit'});}
@@ -1096,7 +1093,11 @@ function onPeriod(){
   document.getElementById('avg').style.display=(p==='profile')?'inline':'none';
   load();
 }
-function isDark(){return window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches;}
+function sysDark(){return window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches;}
+function themePref(){return localStorage.getItem('sv-theme')||'auto';}
+function isDark(){var p=themePref();return p==='dark'||(p==='auto'&&sysDark());}
+function applyTheme(){var p=themePref();document.body.classList.toggle('dark',p==='dark');document.body.classList.toggle('light',p==='light');}
+function setTheme(v){localStorage.setItem('sv-theme',v);applyTheme();load();}
 function load(){
   var p=document.getElementById('p').value, t=Date.now();
   var y=document.getElementById('y').value||'';
@@ -1142,9 +1143,11 @@ function initYears(){
     if(ys.length) sel.value=ys[ys.length-1];
   });
 }
-initYears(); load(); loadQuality();
+initYears(); applyTheme();
+document.getElementById('theme').value=themePref();
+load(); loadQuality();
 var mmdark=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)');
-if(mmdark&&mmdark.addEventListener){mmdark.addEventListener('change',function(){load();});}
+if(mmdark&&mmdark.addEventListener){mmdark.addEventListener('change',function(){if(themePref()==='auto')load();});}
 setInterval(()=>{load(); initYears(); loadQuality();},60000);
 </script></body></html>"""
 
