@@ -37,11 +37,17 @@ MODBUS_PORT = int(os.environ.get("MODBUS_PORT", "502"))
 MODBUS_UNIT = int(os.environ.get("MODBUS_UNIT", "1"))
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "60"))
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8080"))
+APP_VERSION = os.environ.get("APP_VERSION", "0.1.7")
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DB_PATH = os.path.join(DATA_DIR, "energy.db")
 DOUBLE_REG = int(os.environ.get("ENERGY_DOUBLE_REG", "6012"))   # double, 4 regs
 FLOAT_REG = int(os.environ.get("ENERGY_FLOAT_REG", "5006"))     # float, 2 regs
 READ_TIMEOUT = 5.0
+# Netzgrenzen (EN 50160 / VDE-AR-N 4100, 230 V ±10 %, 50 Hz ±1 %)
+LIMIT_U_MIN = float(os.environ.get("LIMIT_U_MIN", "207"))
+LIMIT_U_MAX = float(os.environ.get("LIMIT_U_MAX", "253"))
+LIMIT_F_MIN = float(os.environ.get("LIMIT_F_MIN", "49.5"))
+LIMIT_F_MAX = float(os.environ.get("LIMIT_F_MAX", "50.5"))
 
 _tid = 0
 _tid_lock = threading.Lock()
@@ -84,7 +90,10 @@ def modbus_read(host, port, unit, addr, count):
         if fc & 0x80:
             raise RuntimeError(f"Modbus-Ausnahme Code {rest[1] if len(rest) > 1 else 0}")
         bc = rest[1]
-        return list(struct.unpack(f">{bc // 2}H", rest[2:2 + bc]))
+        data = rest[2:2 + bc]
+        if len(data) < bc:
+            raise ValueError(f"Antwort zu kurz: {len(data)}/{bc} Bytes")
+        return list(struct.unpack(f">{bc // 2}H", data))
     finally:
         s.close()
 
@@ -137,6 +146,19 @@ def init_db():
             wh REAL NOT NULL,             -- Monatsverbrauch laut Geraetespeicher (Wh)
             source TEXT,
             updated REAL
+        );
+        CREATE TABLE IF NOT EXISTS quality(
+            ts REAL PRIMARY KEY,
+            u1 REAL, u2 REAL, u3 REAL,
+            i1 REAL, i2 REAL, i3 REAL,
+            p REAL, f REAL, thd_u REAL
+        );
+        CREATE TABLE IF NOT EXISTS events(
+            id INTEGER PRIMARY KEY,
+            ts_start REAL, ts_end REAL,
+            kind TEXT, direction TEXT,     -- 'below'|'above'
+            extrem REAL, last_value REAL,
+            closed INTEGER DEFAULT 0
         );
         """
     )
@@ -197,6 +219,21 @@ def collector_loop():
             set_meta("last_error", "")
             print(f"{datetime.now().isoformat(timespec='seconds')} poll ok: {wh/1000:.3f} kWh gesamt, "
                   f"Delta {(delta or 0)/1000:.4f} kWh, Quelle {source}", flush=True)
+            # Netzqualitaet (separat, damit Energiezähler nicht davon abhängt)
+            try:
+                try:
+                    q = read_quality()
+                except (ValueError, ConnectionError):
+                    time.sleep(1.0)          # Gerat kurz verschnaufen lassen
+                    q = read_quality()
+                con = db()
+                con.execute("INSERT INTO quality(ts,u1,u2,u3,i1,i2,i3,p,f,thd_u) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                            (now, q["u1"], q["u2"], q["u3"], q["i1"], q["i2"], q["i3"], q["p"], q["f"], q["thd_u"]))
+                con.commit()
+                con.close()
+                check_anomalies(q, now)
+            except Exception as e:
+                set_meta("quality_error", f"{datetime.now(timezone.utc).isoformat()} {type(e).__name__}: {e}")
         except Exception as e:  # Netzwerk/Modbus-Fehler: Protokoll + Retry
             err = f"{type(e).__name__}: {e}"
             set_meta("last_error", f"{datetime.now(timezone.utc).isoformat()} {err}")
@@ -260,86 +297,261 @@ def monthly_backfill_loop():
         time.sleep(12 * 3600)
 
 
+# ---------------- Netzqualitaet: Lesen, Extremwerte, Anomalien ----------------
+def _f(regs, addr, base):
+    """Float ab Registeradresse `addr` innerhalb eines ab `base` gelesenen Blocks.
+    Ein Register pro Adresse: Index = addr - base (float belegt 2 aufeinanderfolgende)."""
+    i = addr - base
+    return struct.unpack(">f", struct.pack(">2H", regs[i], regs[i + 1]))[0]
+
+
+def read_quality():
+    """Liest dokumentierte Messwerte (float-Block ab 1000, THD/Frequenz ab 1214)."""
+    regs = modbus_read(MODBUS_HOST, MODBUS_PORT, MODBUS_UNIT, 1000, 34)   # 1000..1033
+    u1, u2, u3 = _f(regs, 1000, 1000), _f(regs, 1002, 1000), _f(regs, 1004, 1000)
+    i1, i2, i3 = _f(regs, 1012, 1000), _f(regs, 1014, 1000), _f(regs, 1016, 1000)
+    p = _f(regs, 1026, 1000)
+    time.sleep(0.05)
+    regs2 = modbus_read(MODBUS_HOST, MODBUS_PORT, MODBUS_UNIT, 1214, 14)  # 1214..1227
+    thd_u = (_f(regs2, 1214, 1214) + _f(regs2, 1216, 1214) + _f(regs2, 1218, 1214)) / 3.0
+    f = _f(regs2, 1226, 1214)
+    return dict(u1=u1, u2=u2, u3=u3, i1=i1, i2=i2, i3=i3, p=p, f=f, thd_u=thd_u)
+
+
+def read_device_extremes():
+    """Persistente Geraet-Extremwerte: 3000..3020 max, 4000..4020 min (seit Reset).
+    Robust: paarweise Einzelreads (2 Register), damit kurze Antworten nicht stören."""
+    names = ["U L1-N", "U L2-N", "U L3-N", "U L1-L2", "U L2-L3", "U L3-L1",
+             "I L1", "I L2", "I L3", "I Summe", "Frequenz"]
+
+    def read_block(base):
+        out = {}
+        for n in names:
+            try:
+                regs = modbus_read(MODBUS_HOST, MODBUS_PORT, MODBUS_UNIT, base, 2)
+                out[n] = round(_f(regs, base, base), 3)
+            except Exception:
+                out[n] = None
+            time.sleep(0.15)  # Gerat nicht mit Burst-Reads treffen
+            base += 2
+        return out
+
+    data = {"max": read_block(3000), "min": read_block(4000), "ts": time.time()}
+    set_meta("device_extremes", json.dumps(data))
+    print(f"{datetime.now().isoformat(timespec='seconds')} device extremes geladen", flush=True)
+
+
+def check_anomalies(q, ts):
+    """Vergleicht mit den konfigurierten Grenzen, fuehrt die Event-Tabelle."""
+    monitored = [
+        ("Spannung L1-N", q["u1"], LIMIT_U_MIN, LIMIT_U_MAX),
+        ("Spannung L2-N", q["u2"], LIMIT_U_MIN, LIMIT_U_MAX),
+        ("Spannung L3-N", q["u3"], LIMIT_U_MIN, LIMIT_U_MAX),
+        ("Frequenz", q["f"], LIMIT_F_MIN, LIMIT_F_MAX),
+    ]
+    con = db()
+    for kind, val, lo, hi in monitored:
+        if val is None:
+            continue
+        direction = "below" if val < lo else ("above" if val > hi else None)
+        row = con.execute("SELECT id, extrem FROM events WHERE kind=? AND closed=0", (kind,)).fetchone()
+        if direction:
+            ext = val
+            if row:
+                ext = min(row[1], val) if direction == "below" else max(row[1], val)
+                con.execute("UPDATE events SET ts_end=?, extrem=?, last_value=? WHERE id=?",
+                            (ts, ext, val, row[0]))
+            else:
+                con.execute("INSERT INTO events(ts_start,ts_end,kind,direction,extrem,last_value,closed) "
+                            "VALUES(?,?,?,?,?,?,0)", (ts, ts, kind, direction, val, val))
+                print(f"{datetime.now().isoformat(timespec='seconds')} ANOMALIE {kind} {direction}: {val}", flush=True)
+        elif row:
+            st = con.execute("SELECT ts_start FROM events WHERE id=?", (row[0],)).fetchone()[0]
+            con.execute("UPDATE events SET closed=1, ts_end=?, last_value=? WHERE id=?", (ts, val, row[0]))
+            print(f"{datetime.now().isoformat(timespec='seconds')} Anomalie beendet {kind} "
+                  f"(Dauer {int(ts - st)}s)", flush=True)
+    con.commit()
+    con.close()
+
+
+def quality_snapshot():
+    con = db()
+    last = con.execute("SELECT ts,u1,u2,u3,i1,i2,i3,p,f,thd_u FROM quality ORDER BY ts DESC LIMIT 1").fetchone()
+    events = con.execute("SELECT ts_start,ts_end,kind,direction,extrem,last_value,closed FROM events "
+                         "ORDER BY ts_start DESC LIMIT 30").fetchall()
+    con.close()
+    return {
+        "last": dict(zip(["ts", "u1", "u2", "u3", "i1", "i2", "i3", "p", "f", "thd_u"], last)) if last else None,
+        "events": [dict(zip(["ts_start", "ts_end", "kind", "direction", "extrem", "last_value", "closed"], e))
+                   for e in events],
+        "extremes": json.loads(get_meta("device_extremes", "{}")),
+    }
+
+
 # ---------------- Aggregation ----------------
-def period_series(period):
+def period_series(period, year=None):
     """
-    Liefert (labels, values_kwh) fuer das Diagramm und Gesamt-Karten.
-    Perioden: day (14 Tage), week (12 Wochen), month (12 Monate), year (alle Jahre).
-    Datumsbildung in lokaler Zeit (TZ des Containers).
+    Zusammenfuehrung mit fester Prioritaetsregel:
+      - laufender Monat: Live-Deltas (60 s)
+      - abgeschlossene Monate: Geraetearchiv monthly_wh (authoritativ),
+        sonst Live (z.B. Monate ausserhalb des 24-Monats-Geraetefensters)
+      - Jahr = Summe der Monatsquellen, niemals Doppelzaehlung
+      - Tag/Woche: ausschliesslich Live
+    Liefert (labels, values_kWh, cards).
     """
     con = db()
     rows = con.execute(
         "SELECT ts, delta_wh FROM readings WHERE delta_wh IS NOT NULL AND delta_wh >= 0 ORDER BY ts"
     ).fetchall()
+    monthly = {ym: wh / 1000.0 for ym, wh in
+               con.execute("SELECT ym, wh FROM monthly_wh").fetchall()}
     con.close()
 
-    now = time.time()
-    buckets = {}  # sortierbarer Bucket-Key -> kwh
+    now = datetime.now()
+    cur_ym = now.strftime("%Y-%m")
+    live_month, live_day, live_week = {}, {}, {}
     for ts, delta in rows:
         dt = datetime.fromtimestamp(ts)  # lokale Zeit gemaess TZ
-        if period == "day":
-            key = dt.strftime("%Y-%m-%d")
-        elif period == "week":
-            iso = dt.isocalendar()
-            key = f"{iso[0]}-W{iso[1]:02d}"
-        elif period == "month":
-            key = dt.strftime("%Y-%m")
-        else:  # year
-            key = dt.strftime("%Y")
-        buckets[key] = buckets.get(key, 0.0) + delta / 1000.0
+        ym = dt.strftime("%Y-%m")
+        live_month[ym] = live_month.get(ym, 0.0) + delta / 1000.0
+        k_day = dt.strftime("%Y-%m-%d")
+        live_day[k_day] = live_day.get(k_day, 0.0) + delta / 1000.0
+        iso = dt.isocalendar()
+        k_w = f"{iso[0]}-W{iso[1]:02d}"
+        live_week[k_w] = live_week.get(k_w, 0.0) + delta / 1000.0
 
-    # Geraetespeicher (Monatsregister) fuer abgeschlossene Monate/Jahre ergaenzen:
-    con = db()
-    cur_ym = datetime.now().strftime("%Y-%m")
-    cur_year = datetime.now().strftime("%Y")
-    for ym, wh in con.execute("SELECT ym, wh FROM monthly_wh").fetchall():
-        if period == "month" and ym != cur_ym:
-            buckets[ym] = wh / 1000.0
-        elif period == "year" and ym != cur_ym:
-            # abgeschlossene Monate des Geraetespeichers (lfd. Monat laeuft live)
-            buckets[ym[:4]] = buckets.get(ym[:4], 0.0) + wh / 1000.0
-    con.close()
-
-    keys = sorted(buckets.keys())
     if period == "day":
-        keys = keys[-14:]
+        keys = sorted(live_day.keys())[-14:]
         labels = [k[8:10] + "." + k[5:7] + "." for k in keys]
+        values = [round(live_day[k], 2) for k in keys]
     elif period == "week":
-        keys = keys[-12:]
+        keys = sorted(live_week.keys())[-12:]
         labels = [k.replace("-", "/") for k in keys]
+        values = [round(live_week[k], 2) for k in keys]
     elif period == "month":
-        keys = keys[-12:]
-        labels = [k for k in keys]
-    else:
+        yy = int(year) if year else now.year
+        mn = ["Jan", "Feb", "Mar", "Apr", "Mai", "Jun",
+              "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"]
+        labels, values = [], []
+        for m in range(1, 13):
+            k = f"{yy}-{m:02d}"
+            v = monthly.get(k, live_month.get(k, 0.0))
+            if v > 0:
+                labels.append(mn[m - 1])
+                values.append(round(v, 2))
+    else:  # year
+        merged = {}
+        for ym, v in monthly.items():
+            merged[ym[:4]] = merged.get(ym[:4], 0.0) + v
+        for ym, v in live_month.items():
+            if ym not in monthly:
+                merged[ym[:4]] = merged.get(ym[:4], 0.0) + v
+        keys = sorted(merged.keys())
         labels = keys
+        values = [round(merged[k], 1) for k in keys]
 
-    values = [round(buckets[k], 2) for k in keys]
-
-    # Gesamt-Karten (laufende Periode)
-    def bucket_key(dt):
-        if period == "day":
-            return dt.strftime("%Y-%m-%d")
-        if period == "week":
-            iso = dt.isocalendar()
-            return f"{iso[0]}-W{iso[1]:02d}"
-        if period == "month":
-            return dt.strftime("%Y-%m")
-        return dt.strftime("%Y")
-
-    n = datetime.now()
+    iso_now = now.isocalendar()
+    year_card = sum(v for ym, v in monthly.items() if ym[:4] == str(now.year)) + \
+        sum(v for ym, v in live_month.items() if ym[:4] == str(now.year) and ym not in monthly)
     cards = {
-        "tag": round(buckets.get(bucket_key(n), 0.0), 2),
-        "woche": round(buckets.get(bucket_key(n), 0.0), 2),
-        "monat": round(buckets.get(bucket_key(n), 0.0), 2),
-        "jahr": round(buckets.get(bucket_key(n), 0.0), 2),
+        "tag": round(live_day.get(now.strftime("%Y-%m-%d"), 0.0), 2),
+        "woche": round(live_week.get(f"{iso_now[0]}-W{iso_now[1]:02d}", 0.0), 2),
+        "monat": round(monthly.get(cur_ym, live_month.get(cur_ym, 0.0)), 2),
+        "jahr": round(year_card, 2),
     }
     return labels, values, cards
 
 
-def svg_chart(period, labels, values):
+def available_years():
+    con = db()
+    ys = {ym[:4] for (ym,) in con.execute("SELECT ym FROM monthly_wh")}
+    for (ts,) in con.execute("SELECT ts FROM readings").fetchall():
+        ys.add(datetime.fromtimestamp(ts).strftime("%Y"))
+    con.close()
+    ys.add(str(datetime.now().year))
+    return sorted(ys)
+
+
+# ---------------- Tagesverlauf (Stundenprofil) ----------------
+def day_profile(avg_days=7):
+    """Stuendige kWh-Kurven: heute, gestern, Ø der letzten avg_days vorhandenen Tage.
+    Datenbasis: 60-s-Deltas der App (Stundenhistorie vor App-Start existiert nicht)."""
+    from datetime import timedelta
+    con = db()
+    rows = con.execute(
+        "SELECT ts, delta_wh FROM readings WHERE delta_wh IS NOT NULL AND delta_wh >= 0").fetchall()
+    con.close()
+    by_day = {}
+    for ts, d in rows:
+        dt = datetime.fromtimestamp(ts)
+        arr = by_day.setdefault(dt.date(), [0.0] * 24)
+        arr[dt.hour] += d / 1000.0
+    today = datetime.now().date()
+    cur = by_day.get(today, [0.0] * 24)
+    yv = by_day.get(today - timedelta(days=1))
+    prev = []
+    for i in range(1, avg_days + 1):
+        d = today - timedelta(days=i)
+        if d in by_day:
+            prev.append(by_day[d])
+    avg = [round(sum(a[h] for a in prev) / len(prev), 3) for h in range(24)] if prev else [0.0] * 24
+    return cur, yv, avg, len(prev)
+
+
+def svg_day_profile(cur, yv, avg, ndays, avg_days):
+    W, H = 920, 380
+    ml, mr, mt, mb = 62, 18, 56, 46
+    pw, ph = W - ml - mr, H - mt - mb
+    vmax = max(max(cur), max(yv) if yv else 0.0, max(avg) if avg else 0.0, 0.2) * 1.2
+
+    def y(v):
+        return mt + ph - (v / vmax) * ph
+
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" font-family="system-ui,Segoe UI,Arial" font-size="12">']
+    parts.append(f'<rect width="{W}" height="{H}" fill="#ffffff"/>')
+    parts.append(f'<text x="{ml}" y="22" font-size="16" font-weight="600" fill="#222">Stromverbrauch heute vs. gestern · Ø {avg_days} Tage (kWh je Stunde)</text>')
+    # Legende
+    parts.append(f'<rect x="{ml}" y="30" width="10" height="10" fill="#2f7ed8"/><text x="{ml + 14}" y="39" fill="#444">Heute</text>')
+    if yv:
+        parts.append(f'<rect x="{ml + 66}" y="30" width="10" height="10" fill="#c8ccd2"/><text x="{ml + 80}" y="39" fill="#444">Gestern</text>')
+    parts.append(f'<line x1="{ml + (150 if yv else 66)}" y1="35" x2="{ml + (180 if yv else 96)}" y2="35" stroke="#e8820c" stroke-width="2.5"/>'
+                 f'<text x="{ml + (186 if yv else 102)}" y="39" fill="#444">Ø {avg_days} Tage ({ndays} Tage Daten)</text>')
+
+    # Gitter + Y-Beschriftung
+    g = 0.0
+    step = max(0.1, vmax / 5)
+    while g <= vmax:
+        yy = y(g)
+        parts.append(f'<line x1="{ml}" y1="{yy:.1f}" x2="{W - mr}" y2="{yy:.1f}" stroke="#e6e6e6"/>')
+        parts.append(f'<text x="{ml - 8}" y="{yy + 4:.1f}" text-anchor="end" fill="#666">{g:.1f}</text>')
+        g += step
+
+    slot = pw / 24
+    bw = 9 if yv else 18
+    for h in range(24):
+        cx = ml + h * slot + slot / 2
+        if cur[h] > 0:
+            x = cx - (bw + (1 if yv else 0)) if yv else cx - bw / 2
+            parts.append(f'<rect x="{x:.1f}" y="{y(cur[h]):.1f}" width="{bw}" height="{mt + ph - y(cur[h]):.1f}" rx="2" fill="#2f7ed8"/>')
+        if yv and yv[h] > 0:
+            x = cx + (1 if yv else 0)
+            parts.append(f'<rect x="{x:.1f}" y="{y(yv[h]):.1f}" width="{bw}" height="{mt + ph - y(yv[h]):.1f}" rx="2" fill="#c8ccd2"/>')
+        if h % 2 == 0:
+            parts.append(f'<text x="{cx:.1f}" y="{mt + ph + 16}" text-anchor="middle" fill="#666" font-size="10">{h:02d}</text>')
+
+    # Ø-Linie
+    pts = " ".join(f"{ml + h * slot + slot / 2:.1f},{y(avg[h]):.1f}" for h in range(24))
+    parts.append(f'<polyline points="{pts}" fill="none" stroke="#e8820c" stroke-width="2.5"/>')
+    parts.append(f'<text x="{ml + pw / 2:.0f}" y="{H - 6}" text-anchor="middle" fill="#888">Stunde des Tages (lokale Zeit)</text>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def svg_chart(period, labels, values, year=None):
     """Serverseitig gerendertes Balkendiagramm (SVG, keine JS-Libs)."""
     titles = {"day": "Stromverbrauch je Tag (kWh)", "week": "Stromverbrauch je Woche (kWh)",
-              "month": "Stromverbrauch je Monat (kWh)", "year": "Stromverbrauch je Jahr (kWh)"}
+              "month": f"Stromverbrauch je Monat {year or datetime.now().year} (kWh)",
+              "year": "Stromverbrauch je Jahr (kWh)"}
     W, H = 920, 360
     ml, mr, mt, mb = 62, 18, 42, 54
     pw, ph = W - ml - mr, H - mt - mb
@@ -410,7 +622,7 @@ PAGE = """<!doctype html>
 </style></head>
 <body><div class="wrap">
  <h1>&#9889; Stromverbrauch</h1>
- <div class="sub">Janitza UMG 96-PQ-L &middot; Modbus TCP &middot; Datenpunkt alle 60&nbsp;s</div>
+ <div class="sub">Janitza UMG 96-PQ-L &middot; Modbus TCP &middot; Datenpunkt alle 60&nbsp;s &middot; App-Version <b>__VERSION__</b></div>
  <div class="cards">
   <div class="card"><div class="v" id="c-tag">–</div><div class="l">Heute (kWh)</div></div>
   <div class="card"><div class="v" id="c-woche">–</div><div class="l">Diese Woche (kWh)</div></div>
@@ -420,22 +632,95 @@ PAGE = """<!doctype html>
  <div class="panel">
   <div class="row">
    <label for="p"><b>Periode:</b></label>
-   <select id="p" onchange="load()">
+   <select id="p" onchange="onPeriod()">
     <option value="day" selected>Tag (14 Tage)</option>
     <option value="week">Woche (12 Wochen)</option>
-    <option value="month">Monat (12 Monate)</option>
+    <option value="month">Monat</option>
     <option value="year">Jahr (alle Jahre)</option>
+    <option value="profile">Tagesverlauf (Stunden)</option>
+   </select>
+   <label for="y" id="yl" style="display:none"><b>Jahr:</b></label>
+   <select id="y" onchange="load()" style="display:none"></select>
+   <label for="avg" id="avgl" style="display:none"><b>Ø über:</b></label>
+   <select id="avg" onchange="load()" style="display:none">
+    <option value="7" selected>7 Tage</option>
+    <option value="14">14 Tage</option>
+    <option value="30">30 Tage</option>
    </select>
   </div>
   <img id="chart" alt="Balkendiagramm">
   <div class="status" id="status"></div>
  </div>
+ <div class="panel" style="margin-top:16px">
+  <b>Netzqualität</b>
+  <span class="status" id="qts"></span>
+  <div class="cards" style="margin-top:10px">
+   <div class="card"><div class="v" id="q-u">–</div><div class="l">Spannung L1/L2/L3 (V)</div></div>
+   <div class="card"><div class="v" id="q-f">–</div><div class="l">Frequenz (Hz)</div></div>
+   <div class="card"><div class="v" id="q-thd">–</div><div class="l">THD-U (Ø, %)</div></div>
+   <div class="card"><div class="v" id="q-p">–</div><div class="l">Leistung (W)</div></div>
+  </div>
+  <div style="font-size:12px;color:#777" id="q-extrem"></div>
+  <table class="ev" id="evtable">
+   <thead><tr><th>Zeit</th><th>Größe</th><th>Art</th><th>Extrem</th><th>Dauer</th><th>Status</th></tr></thead>
+   <tbody></tbody>
+  </table>
+ </div>
 </div>
+<style>
+ table.ev{width:100%;border-collapse:collapse;font-size:12px;margin-top:10px}
+ table.ev th{color:#777;text-align:left;font-weight:600;padding:4px 6px;border-bottom:1px solid #ddd}
+ table.ev td{padding:4px 6px;border-bottom:1px solid #eee}
+ .open{color:#b00;font-weight:700}
+ .ok{color:#2a8620}
+ .bad{color:#b00}
+</style>
 <script>
+function fmtTs(t){var d=new Date(t*1000);return d.toLocaleString('de-DE',{day:'2-digit',month:'2-digit',year:'2-digit',hour:'2-digit',minute:'2-digit'});}
+function fmtDur(s){if(s==null)return '–';s=Math.round(s);if(s<90)return s+' s';if(s<5400)return Math.round(s/60)+' min';if(s<172800)return (s/3600).toFixed(1)+' h';return (s/86400).toFixed(1)+' d';}
+function loadQuality(){
+ fetch('/api/quality').then(r=>r.json()).then(s=>{
+  var l=s.last||{};
+  document.getElementById('qts').textContent = l.ts? (' zuletzt '+fmtTs(l.ts)) : ' noch keine Messwerte';
+  document.getElementById('q-u').innerHTML = [l.u1,l.u2,l.u3].map(function(v){
+    if(v==null)return '–';
+    var bad = v<window.ULOX||v>window.UHI;
+    return '<span class="'+(bad?'bad':'')+'">'+v.toFixed(0)+'</span>';
+  }).join(' / ');
+  document.getElementById('q-f').innerHTML = l.f==null?'–':'<span class="'+(l.f<window.FLOX||l.f>window.FHI?'bad':'')+'">'+l.f.toFixed(2)+'</span>';
+  document.getElementById('q-thd').textContent = l.thd_u==null?'–':l.thd_u.toFixed(1);
+  document.getElementById('q-p').textContent = l.p==null?'–':Math.round(l.p);
+  var ex=s.extremes||{};
+  if(ex.max){
+   function fv(v){return (v==null)?'–':v;}
+   document.getElementById('q-extrem').innerHTML='Gerät (seit letztem Reset): &nbsp; U L1-N min <b>'+fv(ex.min['U L1-N'])+'</b> / max <b>'+fv(ex.max['U L1-N'])+'</b> V &nbsp;·&nbsp; Frequenz min <b>'+fv(ex.min['Frequenz'])+'</b> / max <b>'+fv(ex.max['Frequenz'])+'</b> Hz &nbsp;·&nbsp; I L1 max <b>'+fv(ex.max['I L1'])+'</b> A';
+  }
+  var tb=document.querySelector('#evtable tbody'); tb.innerHTML='';
+  (s.events||[]).slice(0,15).forEach(function(e){
+   var dur=(e.ts_end-e.ts_start);
+   var st=e.closed?'<span class=ok>beendet</span>':'<span class=open>aktiv</span>';
+   tb.innerHTML+='<tr><td>'+fmtTs(e.ts_start)+'</td><td>'+e.kind+'</td><td>'+(e.direction==='below'?'unter':'über')+' Grenzwert</td><td>'+e.extrem.toFixed(2)+'</td><td>'+fmtDur(dur)+'</td><td>'+st+'</td></tr>';
+  });
+  if(!tb.innerHTML) tb.innerHTML='<tr><td colspan=6 style="color:#777">Keine Vorkommnisse – Netz im Grenzbereich (seit App-Start)</td></tr>';
+ });
+}
+window.ULOX=207; window.UHI=253; window.FLOX=49.5; window.FHI=50.5;
+fetch('/api/envlimits').then(r=>r.json()).then(x=>{window.ULOX=x.u_min;window.UHI=x.u_max;window.FLOX=x.f_min;window.FHI=x.f_max;}).catch(()=>{});
+function onPeriod(){
+  var p=document.getElementById('p').value;
+  document.getElementById('yl').style.display=(p==='month')?'inline':'none';
+  document.getElementById('y').style.display=(p==='month')?'inline':'none';
+  document.getElementById('avgl').style.display=(p==='profile')?'inline':'none';
+  document.getElementById('avg').style.display=(p==='profile')?'inline':'none';
+  load();
+}
 function load(){
   var p=document.getElementById('p').value, t=Date.now();
-  document.getElementById('chart').src='/chart.svg?period='+p+'&ts='+t;
-  fetch('/api/status?t='+t).then(r=>r.json()).then(s=>{
+  var y=document.getElementById('y').value||'';
+  var a=document.getElementById('avg').value||'7';
+  var extra=(p==='month'?'&year='+y:'')+(p==='profile'?'&avg='+a:'');
+  document.getElementById('chart').src='/chart.svg?period='+p+extra+'&ts='+t;
+  fetch('/api/status?period='+p+'&year='+y+'&t='+t).then(r=>r.json()).then(s=>{
     var c=s.cards||{};
     document.getElementById('c-tag').textContent=(c.tag!=null?c.tag:'–');
     document.getElementById('c-woche').textContent=(c.woche!=null?c.woche:'–');
@@ -447,7 +732,15 @@ function load(){
     document.getElementById('status').innerHTML=st;
   });
 }
-load(); setInterval(load,60000);
+function initYears(){
+  fetch('/api/years').then(r=>r.json()).then(ys=>{
+    var sel=document.getElementById('y');
+    sel.innerHTML=ys.slice().reverse().map(y=>'<option>'+y+'</option>').join('');
+    if(ys.length) sel.value=ys[ys.length-1];
+  });
+}
+initYears(); load(); loadQuality();
+setInterval(()=>{load(); initYears(); loadQuality();},60000);
 </script></body></html>"""
 
 
@@ -470,18 +763,33 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         try:
             if u.path == "/":
-                self._send(200, "text/html; charset=utf-8", PAGE)
+                self._send(200, "text/html; charset=utf-8", PAGE.replace("__VERSION__", APP_VERSION))
             elif u.path == "/healthz":
                 self._send(200, "text/plain", "ok")
             elif u.path == "/chart.svg":
                 p = q.get("period", ["day"])[0]
-                labels, values, _ = period_series(p)
-                self._send(200, "image/svg+xml; charset=utf-8", svg_chart(p, labels, values))
+                yr = q.get("year", [None])[0]
+                if p == "profile":
+                    nd = int(q.get("avg", ["7"])[0] or 7)
+                    cur, yv, avg, n = day_profile(nd)
+                    self._send(200, "image/svg+xml; charset=utf-8", svg_day_profile(cur, yv, avg, n, nd))
+                    return
+                labels, values, _ = period_series(p, yr)
+                self._send(200, "image/svg+xml; charset=utf-8", svg_chart(p, labels, values, yr))
+            elif u.path == "/api/years":
+                self._send(200, "application/json", json.dumps(available_years()))
+            elif u.path == "/api/quality":
+                self._send(200, "application/json", json.dumps(quality_snapshot()))
+            elif u.path == "/api/envlimits":
+                self._send(200, "application/json", json.dumps(
+                    {"u_min": LIMIT_U_MIN, "u_max": LIMIT_U_MAX,
+                     "f_min": LIMIT_F_MIN, "f_max": LIMIT_F_MAX}))
             elif u.path == "/api/status":
                 p = q.get("period", ["day"])[0]
-                _, _, cards = period_series(p)
+                _, _, cards = period_series(p, q.get("year", [None])[0])
                 payload = {
                     "cards": cards,
+                    "version": APP_VERSION,
                     "last_ok": get_meta("last_ok"),
                     "source": get_meta("source"),
                     "last_error": get_meta("last_error"),
@@ -489,7 +797,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, "application/json", json.dumps(payload))
             elif u.path == "/api/data":
                 p = q.get("period", ["day"])[0]
-                labels, values, cards = period_series(p)
+                labels, values, cards = period_series(p, q.get("year", [None])[0])
                 self._send(200, "application/json",
                            json.dumps({"period": p, "labels": labels, "values": values, "cards": cards}))
             else:
@@ -500,6 +808,10 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     init_db()
+    try:
+        read_device_extremes()
+    except Exception as e:
+        print(f"device extremes FEHLER: {e}", flush=True)
     threading.Thread(target=collector_loop, daemon=True).start()
     threading.Thread(target=monthly_backfill_loop, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler)
