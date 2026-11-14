@@ -37,7 +37,7 @@ MODBUS_PORT = int(os.environ.get("MODBUS_PORT", "502"))
 MODBUS_UNIT = int(os.environ.get("MODBUS_UNIT", "1"))
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "60"))
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8080"))
-APP_VERSION = os.environ.get("APP_VERSION", "0.2.5")
+APP_VERSION = os.environ.get("APP_VERSION", "0.2.6")
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DB_PATH = os.path.join(DATA_DIR, "energy.db")
 DOUBLE_REG = int(os.environ.get("ENERGY_DOUBLE_REG", "6012"))   # double, 4 regs
@@ -467,10 +467,10 @@ def theme(dark):
     if dark:
         return {"bg": "#16181d", "grid": "#2a2d34", "txt": "#a8adb8", "title": "#e8eaf0",
                 "sub": "#7d828c", "bar": "#5aa2f0", "bar2": "#4a4f58", "val": "#c8ccd4",
-                "empty": "#20242b", "c0": (35, 40, 48), "c1": (90, 162, 240)}
+                "empty": "#3a3f47", "c0": (166, 44, 38), "c1": (246, 214, 106)}
     return {"bg": "#ffffff", "grid": "#e6e6e6", "txt": "#666666", "title": "#222222",
             "sub": "#888888", "bar": "#2f7ed8", "bar2": "#c8ccd2", "val": "#333333",
-            "empty": "#fafbfc", "c0": (235, 240, 250), "c1": (37, 99, 216)}
+            "empty": "#cfcfcf", "c0": (217, 57, 47), "c1": (252, 222, 90)}
 
 
 # ---------------- Leistung (Lastgang) & Heatmap ----------------
@@ -623,6 +623,7 @@ def svg_heatmap(grid, counts, dark=False, label="Ganzes Jahr"):
 
     def color(v):
         t = 0.0 if not vmax else min(1.0, v / vmax)
+        t = t ** 0.85
         r = int(th["c0"][0] + (th["c1"][0] - th["c0"][0]) * t)
         g = int(th["c0"][1] + (th["c1"][1] - th["c0"][1]) * t)
         b = int(th["c0"][2] + (th["c1"][2] - th["c0"][2]) * t)
@@ -632,6 +633,18 @@ def svg_heatmap(grid, counts, dark=False, label="Ganzes Jahr"):
     parts.append(f'<rect width="{W}" height="{H}" fill="{th["bg"]}"/>')
     nd = f" (Ø über {min(counts.values()) if counts else 0} volle Tage je Wochentag)" if counts else ""
     parts.append(f'<text x="{ml}" y="24" font-size="16" font-weight="600" fill="{th["title"]}">Wann verbraucht das Haus? kWh je Wochentag × Stunde · {html.escape(label)}{nd}</text>')
+    c0s = "rgb(%d,%d,%d)" % th["c0"]; c1s = "rgb(%d,%d,%d)" % th["c1"]
+    lx = W - 250
+    parts.append(f'<text x="{lx - 6}" y="{mt - 22}" text-anchor="end" fill="{th["txt"]}" font-size="10">niedrig</text>')
+    parts.append(f'<rect x="{lx}" y="{mt - 30}" width="110" height="10" fill="{c0s}" stroke="{th["grid"]}" stroke-width="0.7"/>')
+    steps = 11
+    for i in range(1, steps):
+        t = i / (steps - 1)
+        r = int(th["c0"][0] + (th["c1"][0] - th["c0"][0]) * t)
+        g = int(th["c0"][1] + (th["c1"][1] - th["c0"][1]) * t)
+        b = int(th["c0"][2] + (th["c1"][2] - th["c0"][2]) * t)
+        parts.append(f'<rect x="{lx + i * 110 / steps:.1f}" y="{mt - 30}" width="{110 / steps:.1f}" height="10" fill="rgb({r},{g},{b})"/>')
+    parts.append(f'<text x="{lx + 116}" y="{mt - 22}" fill="{th["txt"]}" font-size="10">hoch (max {de(vmax)} kWh)</text>')
     if not flat:
         parts.append(f'<text x="{W / 2:.0f}" y="{H / 2:.0f}" text-anchor="middle" fill="{th["sub"]}">Keine vollen Tage (≥20 h) im gewählten Zeitraum – die Heatmap wächst mit.</text>')
     for wd in range(7):
@@ -643,7 +656,7 @@ def svg_heatmap(grid, counts, dark=False, label="Ganzes Jahr"):
             parts.append(f'<rect x="{x:.2f}" y="{y:.2f}" width="{cw:.2f}" height="{ch:.2f}" fill="{fill}" stroke="{th["grid"]}" stroke-width="0.7"/>')
     for h in range(0, 24, 2):
         parts.append(f'<text x="{ml + h * cw + cw / 2:.1f}" y="{mt + ph + 16}" text-anchor="middle" fill="{th["txt"]}" font-size="10">{h:02d}</text>')
-    parts.append(f'<text x="{ml + pw / 2:.0f}" y="{H - 6}" text-anchor="middle" fill="{th["sub"]}">Dunkelblau = hoher Verbrauch · Nachtspitzen können Poolpumpe/Gewächshaus (Frostschutz) sein</text>')
+    parts.append(f'<text x="{ml + pw / 2:.0f}" y="{H - 6}" text-anchor="middle" fill="{th["sub"]}">Rot = niedrig · Gelb = hoch · Grau = keine Daten · Nachtspitzen können Poolpumpe/Gewächshaus (Frostschutz) sein</text>')
     parts.append("</svg>")
     return "".join(parts)
 
