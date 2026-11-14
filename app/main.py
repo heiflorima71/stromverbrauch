@@ -37,7 +37,7 @@ MODBUS_PORT = int(os.environ.get("MODBUS_PORT", "502"))
 MODBUS_UNIT = int(os.environ.get("MODBUS_UNIT", "1"))
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "60"))
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8080"))
-APP_VERSION = os.environ.get("APP_VERSION", "0.2.3")
+APP_VERSION = os.environ.get("APP_VERSION", "0.2.4")
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DB_PATH = os.path.join(DATA_DIR, "energy.db")
 DOUBLE_REG = int(os.environ.get("ENERGY_DOUBLE_REG", "6012"))   # double, 4 regs
@@ -581,12 +581,16 @@ def heatmap_series(ym="all"):
     con = db()
     rows = con.execute("SELECT ts, delta_wh FROM readings WHERE delta_wh IS NOT NULL AND delta_wh >= 0").fetchall()
     con.close()
-    sums = {}
-    for ts, d in rows:
-        dt = datetime.fromtimestamp(ts)
-        sums[(dt.weekday(), dt.hour)] = sums.get((dt.weekday(), dt.hour), 0.0) + d / 1000.0
+    sums, cnts = {}, {}
     by_day = _full_days_by_hour(rows)
     days = [d for d, hs in by_day.items() if len(hs) >= 20 and (ym == "all" or d.strftime("%Y-%m") == ym)]
+    dsel = set(days)
+    for ts, d in rows:
+        dt = datetime.fromtimestamp(ts)
+        if dt.date() in dsel:
+            k = (dt.weekday(), dt.hour)
+            sums[k] = sums.get(k, 0.0) + d / 1000.0
+            cnts[k] = cnts.get(k, 0) + 1
     counts = {}
     for d in days:
         counts[d.weekday()] = counts.get(d.weekday(), 0) + 1
@@ -594,8 +598,8 @@ def heatmap_series(ym="all"):
     for wd in range(7):
         row = []
         for h in range(24):
-            n = counts.get(wd, 0)
-            row.append(round(sums.get((wd, h), 0.0) / n, 2) if n else None)
+            n = cnts.get((wd, h), 0)
+            row.append(round(sums[(wd, h)] / n, 2) if n else None)
         grid.append(row)
     return grid, counts
 
