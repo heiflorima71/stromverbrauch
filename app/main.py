@@ -37,7 +37,7 @@ MODBUS_PORT = int(os.environ.get("MODBUS_PORT", "502"))
 MODBUS_UNIT = int(os.environ.get("MODBUS_UNIT", "1"))
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "60"))
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8080"))
-APP_VERSION = os.environ.get("APP_VERSION", "0.2.4")
+APP_VERSION = os.environ.get("APP_VERSION", "0.2.5")
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DB_PATH = os.path.join(DATA_DIR, "energy.db")
 DOUBLE_REG = int(os.environ.get("ENERGY_DOUBLE_REG", "6012"))   # double, 4 regs
@@ -457,6 +457,12 @@ def quality_snapshot():
 
 
 # ---------------- Themen (hell/dunkel) fuer SVG-Diagramme ----------------
+def de(v, dec=2):
+    """Zahl im deutschen Format: Komma als Dezimal-, Punkt als Tausendertrennzeichen."""
+    s = f"{v:,.{dec}f}"
+    return s.replace(".", "\x00").replace(",", ".").replace("\x00", ",")
+
+
 def theme(dark):
     if dark:
         return {"bg": "#16181d", "grid": "#2a2d34", "txt": "#a8adb8", "title": "#e8eaf0",
@@ -534,7 +540,7 @@ def svg_power(labels, vals, stats, dark=False):
     while g <= vmax:
         y = Y(g)
         parts.append(f'<line x1="{ml}" y1="{y:.1f}" x2="{W - mr}" y2="{y:.1f}" stroke="{th["grid"]}"/>')
-        parts.append(f'<text x="{ml - 8}" y="{y + 4:.1f}" text-anchor="end" fill="{th["txt"]}">{g:.1f}</text>')
+        parts.append(f'<text x="{ml - 8}" y="{y + 4:.1f}" text-anchor="end" fill="{th["txt"]}">{de(g, 1)}</text>')
         g += step
     if pts:
         poly = " ".join(f"{X(i):.1f},{Y(v):.1f}" for i, v in pts)
@@ -544,16 +550,16 @@ def svg_power(labels, vals, stats, dark=False):
         if stats.get("peak") is not None:
             pi, pv = max(pts, key=lambda t: t[1])
             parts.append(f'<circle cx="{X(pi):.1f}" cy="{Y(pv):.1f}" r="4" fill="#e05555"/>')
-            parts.append(f'<text x="{X(pi):.1f}" y="{Y(pv) - 8:.1f}" text-anchor="middle" fill="#e05555" font-size="11">Spitze {pv:.2f}</text>')
+            parts.append(f'<text x="{X(pi):.1f}" y="{Y(pv) - 8:.1f}" text-anchor="middle" fill="#e05555" font-size="11">Spitze {de(pv, 2)}</text>')
     for i in range(0, 48, 4):
         parts.append(f'<text x="{X(i):.1f}" y="{mt + ph + 16}" text-anchor="middle" fill="{th["txt"]}" font-size="10">{labels[i]}</text>')
     note = []
     if stats.get("avg24") is not None:
-        note.append(f"Ø 24 h: {stats['avg24']} kW")
+        note.append(f"Ø 24 h: {de(stats['avg24'], 2)} kW")
     if stats.get("peak") is not None:
-        note.append(f"Spitzenleistung: {stats['peak']} kW")
+        note.append(f"Spitzenleistung: {de(stats['peak'], 2)} kW")
     if stats.get("grundlast") is not None:
-        note.append(f"Grundlast {NIGHT_START_HOUR:02d}–{NIGHT_END_HOUR:02d} h (7 T): {stats['grundlast']} kW"
+        note.append(f"Grundlast {NIGHT_START_HOUR:02d}–{NIGHT_END_HOUR:02d} h (7 T): {de(stats['grundlast'], 2)} kW"
                     + (f" ({stats['grundlast_when']})" if stats.get("grundlast_when") else ""))
     parts.append(f'<text x="{ml + pw / 2:.0f}" y="{H - 6}" text-anchor="middle" fill="{th["sub"]}">{" · ".join(note)}</text>')
     parts.append("</svg>")
@@ -694,12 +700,12 @@ def svg_weather(series, dark=False):
     while g <= kmax:
         y = Yk(g)
         parts.append(f'<line x1="{ml}" y1="{y:.1f}" x2="{W - mr}" y2="{y:.1f}" stroke="{th["grid"]}"/>')
-        parts.append(f'<text x="{ml - 8}" y="{y + 4:.1f}" text-anchor="end" fill="{th["txt"]}">{g:.0f}</text>')
+        parts.append(f'<text x="{ml - 8}" y="{y + 4:.1f}" text-anchor="end" fill="{th["txt"]}">{de(g, 0)}</text>')
         g += step
     g = t_lo
     step = (t_hi - t_lo) / 4
     while g <= t_hi:
-        parts.append(f'<text x="{W - mr + 8}" y="{Yt(g) + 4:.1f}" fill="{th["txt"]}">{g:.0f}°</text>')
+        parts.append(f'<text x="{W - mr + 8}" y="{Yt(g) + 4:.1f}" fill="{th["txt"]}">{de(g, 0)}°</text>')
         g += step
     n = len(series)
     bw = pw / n
@@ -720,7 +726,7 @@ def svg_weather(series, dark=False):
             parts.append(f'<text x="{cx:.1f}" y="{mt + ph + 16}" text-anchor="middle" fill="{th["txt"]}" font-size="9" transform="rotate(30 {cx:.1f} {mt + ph + 16})">{ymd[8:10]}.{ymd[5:7]}.</text>')
     if len(pts) > 1:
         parts.append(f'<polyline points="{" ".join(pts)}" fill="none" stroke="#e8820c" stroke-width="2.5"/>')
-    parts.append(f'<text x="{ml + pw / 2:.0f}" y="{H - 6}" text-anchor="middle" fill="{th["sub"]}">{n} Tage Temperatur · {ndays_kwh} Tage mit Verbrauchsbalken (Balken erst ab App-Start) · Heizgradtage (18-°C-Basis): {hdd:.0f} · Quelle: Open-Meteo</text>')
+    parts.append(f'<text x="{ml + pw / 2:.0f}" y="{H - 6}" text-anchor="middle" fill="{th["sub"]}">{n} Tage Temperatur · {ndays_kwh} Tage mit Verbrauchsbalken (Balken erst ab App-Start) · Heizgradtage (18-°C-Basis): {de(hdd, 0)} · Quelle: Open-Meteo</text>')
     parts.append("</svg>")
     return "".join(parts)
 
@@ -884,7 +890,7 @@ def svg_day_profile(cur, yv, avg, ndays, avg_days, dark=False):
     while g <= vmax:
         yy = y(g)
         parts.append(f'<line x1="{ml}" y1="{yy:.1f}" x2="{W - mr}" y2="{yy:.1f}" stroke="{th["grid"]}"/>')
-        parts.append(f'<text x="{ml - 8}" y="{yy + 4:.1f}" text-anchor="end" fill="{th["txt"]}">{g:.1f}</text>')
+        parts.append(f'<text x="{ml - 8}" y="{yy + 4:.1f}" text-anchor="end" fill="{th["txt"]}">{de(g, 1)}</text>')
         g += step
 
     slot = pw / 24
@@ -946,7 +952,7 @@ def svg_chart(period, labels, values, year=None, prev_values=None, prev_year=Non
     while g <= vmax:
         y = mt + ph - (g / vmax) * ph
         parts.append(f'<line x1="{ml}" y1="{y:.1f}" x2="{W - mr}" y2="{y:.1f}" stroke="{th["grid"]}"/>')
-        parts.append(f'<text x="{ml - 8}" y="{y + 4:.1f}" text-anchor="end" fill="{th["txt"]}">{g:g}</text>')
+        parts.append(f'<text x="{ml - 8}" y="{y + 4:.1f}" text-anchor="end" fill="{th["txt"]}">{de(g, 0 if step >= 1 else 1)}</text>')
         g += step
 
     n = len(values)
@@ -960,7 +966,7 @@ def svg_chart(period, labels, values, year=None, prev_values=None, prev_year=Non
             hgt = (v / vmax) * ph
             y = mt + ph - hgt
             parts.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_w:.1f}" height="{hgt:.1f}" rx="3" fill="{th["bar"]}"/>')
-            parts.append(f'<text x="{x + bar_w / 2:.1f}" y="{y - 5:.1f}" text-anchor="middle" fill="{th["val"]}" font-size="10">{v:g}</text>')
+            parts.append(f'<text x="{x + bar_w / 2:.1f}" y="{y - 5:.1f}" text-anchor="middle" fill="{th["val"]}" font-size="10">{de(v, 2)}</text>')
             if paired:
                 pv = prev_values[i] if i < len(prev_values) else None
                 if pv:
@@ -1083,11 +1089,11 @@ function loadQuality(){
   document.getElementById('q-u').innerHTML = [l.u1,l.u2,l.u3].map(function(v){
     if(v==null)return '–';
     var bad = v<window.ULOX||v>window.UHI;
-    return '<span class="'+(bad?'bad':'')+'">'+v.toFixed(0)+'</span>';
+    return '<span class="'+(bad?'bad':'')+'">'+Math.round(v).toLocaleString('de-DE')+'</span>';
   }).join(' / ');
-  document.getElementById('q-f').innerHTML = l.f==null?'–':'<span class="'+(l.f<window.FLOX||l.f>window.FHI?'bad':'')+'">'+l.f.toFixed(2)+'</span>';
-  document.getElementById('q-thd').textContent = l.thd_u==null?'–':l.thd_u.toFixed(1);
-  document.getElementById('q-p').textContent = l.p==null?'–':Math.round(l.p);
+  document.getElementById('q-f').innerHTML = l.f==null?'–':'<span class="'+(l.f<window.FLOX||l.f>window.FHI?'bad':'')+'">'+l.f.toLocaleString('de-DE',{minimumFractionDigits:2,maximumFractionDigits:2})+'</span>';
+  document.getElementById('q-thd').textContent = l.thd_u==null?'–':l.thd_u.toLocaleString('de-DE',{minimumFractionDigits:1,maximumFractionDigits:1});
+  document.getElementById('q-p').textContent = l.p==null?'–':Math.round(l.p).toLocaleString('de-DE');
   var ex=s.extremes||{};
   if(ex.max){
    function fv(v){return (v==null)?'–':v;}
@@ -1097,14 +1103,16 @@ function loadQuality(){
   (s.events||[]).slice(0,15).forEach(function(e){
    var dur=(e.ts_end-e.ts_start);
    var st=e.closed?'<span class=ok>beendet</span>':'<span class=open>aktiv</span>';
-   tb.innerHTML+='<tr><td>'+fmtTs(e.ts_start)+'</td><td>'+e.kind+'</td><td>'+(e.direction==='below'?'unter':'über')+' Grenzwert</td><td>'+e.extrem.toFixed(2)+'</td><td>'+fmtDur(dur)+'</td><td>'+st+'</td></tr>';
+   tb.innerHTML+='<tr><td>'+fmtTs(e.ts_start)+'</td><td>'+e.kind+'</td><td>'+(e.direction==='below'?'unter':'über')+' Grenzwert</td><td>'+e.extrem.toLocaleString('de-DE',{minimumFractionDigits:2,maximumFractionDigits:2})+'</td><td>'+fmtDur(dur)+'</td><td>'+st+'</td></tr>';
   });
   if(!tb.innerHTML) tb.innerHTML='<tr><td colspan=6 style="color:#777">Keine Vorkommnisse – Netz im Grenzbereich (seit App-Start)</td></tr>';
  });
 }
 window.ULOX=207; window.UHI=253; window.FLOX=49.5; window.FHI=50.5; window.NIGHTL=0; window.NS=2; window.NE=5;
-function pwpeak(pw){return pw.peak!=null?(pw.peak+' kW ('+(pw.avg24!=null?('Ø 24 h '+pw.avg24+' kW'):'–')+')'):'–';}
+function pwpeak(pw){return pw.peak!=null?(fmtDe2(pw.peak)+' kW ('+(pw.avg24!=null?('Ø 24 h '+fmtDe2(pw.avg24)+' kW'):'–')+')'):'–';}
 fetch('/api/envlimits').then(r=>r.json()).then(x=>{window.ULOX=x.u_min;window.UHI=x.u_max;window.FLOX=x.f_min;window.FHI=x.f_max;window.NIGHTL=x.night_limit_w;window.NS=x.night_start;window.NE=x.night_end;}).catch(()=>{});
+function fmtDe(v){return Number(v).toLocaleString('de-DE',{maximumFractionDigits:2});}
+function fmtDe2(v){return Number(v).toLocaleString('de-DE',{minimumFractionDigits:2,maximumFractionDigits:2});}
 function onPeriod(){
   var p=document.getElementById('p').value;
   document.getElementById('yl').style.display=(p==='month')?'inline':'none';
@@ -1129,15 +1137,15 @@ function load(){
   document.getElementById('chart').src='/chart.svg?period='+p+extra+'&ts='+t;
   fetch('/api/status?period='+p+'&year='+y+'&t='+t).then(r=>r.json()).then(s=>{
     var c=s.cards||{};
-    document.getElementById('c-tag').textContent=(c.tag!=null?c.tag:'–');
-    document.getElementById('c-woche').textContent=(c.woche!=null?c.woche:'–');
-    document.getElementById('c-monat').textContent=(c.monat!=null?c.monat:'–');
-    document.getElementById('c-jahr').textContent=(c.jahr!=null?c.jahr:'–');
+    document.getElementById('c-tag').textContent=(c.tag!=null?fmtDe(c.tag):'–');
+    document.getElementById('c-woche').textContent=(c.woche!=null?fmtDe(c.woche):'–');
+    document.getElementById('c-monat').textContent=(c.monat!=null?fmtDe(c.monat):'–');
+    document.getElementById('c-jahr').textContent=(c.jahr!=null?fmtDe(c.jahr):'–');
     function eu(id,v){document.getElementById(id).textContent=(v!=null)?('≈ '+v.toLocaleString('de-DE',{minimumFractionDigits:2,maximumFractionDigits:2})+' €'):'';}
     eu('c-tag-eu',c.eur_tag); eu('c-woche-eu',c.eur_woche); eu('c-monat-eu',c.eur_monat); eu('c-jahr-eu',c.eur_jahr);
     if(c.prognose!=null){
       document.getElementById('c-prog').style.display='block';
-      document.getElementById('c-prognose').textContent=c.prognose;
+      document.getElementById('c-prognose').textContent=fmtDe(c.prognose);
       document.getElementById('c-prog-l').textContent='Prognose '+new Date().getFullYear()+' (kWh)';
       eu('c-prog-eu',c.eur_prognose);
     } else { document.getElementById('c-prog').style.display='none'; }
@@ -1145,7 +1153,7 @@ function load(){
            (s.source?(' &middot; Quelle '+s.source):'');
     if(p==='power'&&s.power){
       var pw=s.power;
-      st+='<br>Spitzenleistung '+(pwpeak(pw))+ ' · Grundlast (7 T, nachts) '+(pw.grundlast!=null?pw.grundlast+' kW':'–')+
+      st+='<br>Spitzenleistung '+(pwpeak(pw))+ ' · Grundlast (7 T, nachts) '+(pw.grundlast!=null?fmtDe2(pw.grundlast)+' kW':'–')+
           (pw.grundlast_when?(' am '+pw.grundlast_when):'')+
           ' · <span style="color:#888">Standby-Wächter: '+(window.NIGHTL>0?('Grenze '+window.NIGHTL+' W ('+window.NS+'–'+window.NE+' h)'):'aus (Poolpumpe/Frostschutz = Normalbetrieb)')+'</span>';
     }
