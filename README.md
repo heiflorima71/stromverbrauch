@@ -12,6 +12,9 @@ ein **Stundenprofil** (heute vs. gestern vs. Ø der letzten X Tage) und ein
 - **Monatsarchiv**: holt die 24 rollenden Monatsregister des Zählers (double-Block
   6248/6296) alle 12 h in die eigene DB → echte Historie ab Geräte-Inbetriebnahme
 - **Tagesverlauf**: kWh je Stunde, heute vs. gestern + Ø-Linie über 7/14/30 Tage
+- **Heatmap**: Wochentag × Stunde, wählbar je Monat oder Ganzes Jahr (Farbskala pro Zeitraum relativ)
+- **Wettervergleich**: Tages-kWh gegen Tagesmittel-Temperatur (Open-Meteo, nur abgefragt; WX_LAT/WX_LON)
+- **Theme**: Auto/Dunkel/Hell (CSS-Variablen, serverseitig mitgedunkelte SVGs)
 - **Netzqualität**: Spannung L1–L3, Frequenz, THD-U, Leistung je Poll;
   Anomalie-Events (Start/Extrem/Dauer) bei Grenzwertverletzung nach EN 50160
   (207–253 V, 49,5–50,5 Hz, per Env anpassbar); persistente Geräte-Extremwerte
@@ -28,7 +31,7 @@ ein **Stundenprofil** (heute vs. gestern vs. Ø der letzten X Tage) und ein
 
 ## Deployment (Olares)
 
-Image: `ghcr.io/heiflorima71/stromverbrauch:v0.1.7` (linux/amd64).
+Image: `ghcr.io/heiflorima71/stromverbrauch:v0.2.1` (linux/amd64).
 
 Konfiguration über die Olares-Installationsmaske:
 `MODBUS_HOST`, `MODBUS_PORT`, `MODBUS_UNIT`, `POLL_SECONDS`,
