@@ -560,35 +560,47 @@ def svg_power(labels, vals, stats, dark=False):
     return "".join(parts)
 
 
-def heatmap_series():
-    """Ø kWh je (Wochentag, Stunde) ueber alle vorhandenen vollen Tage."""
-    con = db()
-    rows = con.execute("SELECT ts, delta_wh FROM readings WHERE delta_wh IS NOT NULL AND delta_wh >= 0").fetchall()
-    con.close()
-    sums, days = {}, set()
+def _full_days_by_hour(rows):
     by_day = {}
     for ts, d in rows:
         dt = datetime.fromtimestamp(ts)
-        sums[(dt.weekday(), dt.hour)] = sums.get((dt.weekday(), dt.hour), 0.0) + d / 1000.0
         by_day.setdefault(dt.date(), set()).add(dt.hour)
-        days.add(dt.date())
-    # Wochentage nur mit Tagen bewerten, die >=20 h Daten haben (volle Tage)
-    good = {d.weekday() for d, hs in by_day.items() if len(hs) >= 20}
+    return by_day
+
+
+def heatmap_months():
+    """Monate mit >=1 vollen (>=20 h) Tagen, neueste zuerst."""
+    con = db()
+    rows = con.execute("SELECT ts, delta_wh FROM readings WHERE delta_wh IS NOT NULL AND delta_wh >= 0").fetchall()
+    con.close()
+    return sorted({dt.strftime("%Y-%m") for dt, hs in _full_days_by_hour(rows).items() if len(hs) >= 20}, reverse=True)
+
+
+def heatmap_series(ym="all"):
+    """Ø kWh je (Wochentag, Stunde). ym='all' = alle vollen Tage, sonst nur 'YYYY-MM'."""
+    con = db()
+    rows = con.execute("SELECT ts, delta_wh FROM readings WHERE delta_wh IS NOT NULL AND delta_wh >= 0").fetchall()
+    con.close()
+    sums = {}
+    for ts, d in rows:
+        dt = datetime.fromtimestamp(ts)
+        sums[(dt.weekday(), dt.hour)] = sums.get((dt.weekday(), dt.hour), 0.0) + d / 1000.0
+    by_day = _full_days_by_hour(rows)
+    days = [d for d, hs in by_day.items() if len(hs) >= 20 and (ym == "all" or d.strftime("%Y-%m") == ym)]
     counts = {}
     for d in days:
-        if len(by_day[d]) >= 20:
-            counts[d.weekday()] = counts.get(d.weekday(), 0) + 1
+        counts[d.weekday()] = counts.get(d.weekday(), 0) + 1
     grid = []
     for wd in range(7):
         row = []
         for h in range(24):
             n = counts.get(wd, 0)
-            row.append(round(sums.get((wd, h), 0.0) / n, 2) if (wd in good and n) else None)
+            row.append(round(sums.get((wd, h), 0.0) / n, 2) if n else None)
         grid.append(row)
     return grid, counts
 
 
-def svg_heatmap(grid, counts, dark=False):
+def svg_heatmap(grid, counts, dark=False, label="Ganzes Jahr"):
     """Heatmap Wochentag x Stunde: eingefaerbte Zellen (Ø kWh)."""
     th = theme(dark)
     W, H = 920, 340
@@ -608,10 +620,10 @@ def svg_heatmap(grid, counts, dark=False):
 
     parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" font-family="system-ui,Segoe UI,Arial" font-size="12">']
     parts.append(f'<rect width="{W}" height="{H}" fill="{th["bg"]}"/>')
-    nd = f" (Basis: Ø {min(counts.values()) if counts else 0} volle Tage je Wochentag)" if counts else ""
-    parts.append(f'<text x="{ml}" y="24" font-size="16" font-weight="600" fill="{th["title"]}">Wann verbraucht das Haus? kWh je Wochentag × Stunde{nd}</text>')
+    nd = f" (Ø über {min(counts.values()) if counts else 0} volle Tage je Wochentag)" if counts else ""
+    parts.append(f'<text x="{ml}" y="24" font-size="16" font-weight="600" fill="{th["title"]}">Wann verbraucht das Haus? kWh je Wochentag × Stunde · {html.escape(label)}{nd}</text>')
     if not flat:
-        parts.append(f'<text x="{W / 2:.0f}" y="{H / 2:.0f}" text-anchor="middle" fill="{th["sub"]}">Noch keine vollen Tage (≥20 h) im Datenbestand – die Heatmap wächst mit.</text>')
+        parts.append(f'<text x="{W / 2:.0f}" y="{H / 2:.0f}" text-anchor="middle" fill="{th["sub"]}">Keine vollen Tage (≥20 h) im gewählten Zeitraum – die Heatmap wächst mit.</text>')
     for wd in range(7):
         parts.append(f'<text x="{ml - 8}" y="{mt + wd * ch + ch / 2 + 4:.1f}" text-anchor="end" fill="{th["txt"]}">{names[wd]}</text>')
         for h in range(24):
@@ -1014,6 +1026,10 @@ PAGE = """<!doctype html>
     <option value="heatmap">Heatmap (Woche × Stunde)</option>
     <option value="weather">Wettervergleich (Tag)</option>
    </select>
+   <label for="hm" id="hml" style="display:none"><b>Heatmap:</b></label>
+   <select id="hm" onchange="load()" style="display:none">
+    <option value="all">Ganzes Jahr</option>
+   </select>
    <label for="theme"><b>Theme:</b></label>
    <select id="theme" onchange="setTheme(this.value)">
     <option value="auto" selected>Auto</option>
@@ -1091,6 +1107,8 @@ function onPeriod(){
   document.getElementById('y').style.display=(p==='month')?'inline':'none';
   document.getElementById('avgl').style.display=(p==='profile')?'inline':'none';
   document.getElementById('avg').style.display=(p==='profile')?'inline':'none';
+  document.getElementById('hml').style.display=(p==='heatmap')?'inline':'none';
+  document.getElementById('hm').style.display=(p==='heatmap')?'inline':'none';
   load();
 }
 function sysDark(){return window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches;}
@@ -1102,7 +1120,8 @@ function load(){
   var p=document.getElementById('p').value, t=Date.now();
   var y=document.getElementById('y').value||'';
   var a=document.getElementById('avg').value||'7';
-  var extra=(p==='month'?'&year='+y:'')+(p==='profile'?'&avg='+a:'')+(isDark()?'&dark=1':'');
+  var hm=document.getElementById('hm').value||'all';
+  var extra=(p==='month'?'&year='+y:'')+(p==='profile'?'&avg='+a:'')+(p==='heatmap'?'&ym='+hm:'')+(isDark()?'&dark=1':'');
   document.getElementById('chart').src='/chart.svg?period='+p+extra+'&ts='+t;
   fetch('/api/status?period='+p+'&year='+y+'&t='+t).then(r=>r.json()).then(s=>{
     var c=s.cards||{};
@@ -1136,6 +1155,13 @@ function load(){
     }
   });
 }
+function initHm(){
+  fetch('/api/heatmapmonths').then(r=>r.json()).then(ms=>{
+    var sel=document.getElementById('hm'), cur=sel.value||'all';
+    sel.innerHTML='<option value="all">Ganzes Jahr</option>'+ms.map(m=>'<option value="'+m+'">'+m.slice(5,7)+'.'+m.slice(0,4)+'</option>').join('');
+    if(cur) sel.value=cur;
+  });
+}
 function initYears(){
   fetch('/api/years').then(r=>r.json()).then(ys=>{
     var sel=document.getElementById('y');
@@ -1143,12 +1169,12 @@ function initYears(){
     if(ys.length) sel.value=ys[ys.length-1];
   });
 }
-initYears(); applyTheme();
+initYears(); initHm(); applyTheme();
 document.getElementById('theme').value=themePref();
 load(); loadQuality();
 var mmdark=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)');
 if(mmdark&&mmdark.addEventListener){mmdark.addEventListener('change',function(){if(themePref()==='auto')load();});}
-setInterval(()=>{load(); initYears(); loadQuality();},60000);
+setInterval(()=>{load(); initYears(); initHm(); loadQuality();},60000);
 </script></body></html>"""
 
 
@@ -1188,8 +1214,10 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(200, "image/svg+xml; charset=utf-8", svg_power(labels, vals, power_stats(), dark))
                     return
                 if p == "heatmap":
-                    grid, counts = heatmap_series()
-                    self._send(200, "image/svg+xml; charset=utf-8", svg_heatmap(grid, counts, dark))
+                    ym = q.get("ym", ["all"])[0]
+                    grid, counts = heatmap_series(ym)
+                    lbl = "Ganzes Jahr" if ym == "all" else (ym[5:7] + "." + ym[:4])
+                    self._send(200, "image/svg+xml; charset=utf-8", svg_heatmap(grid, counts, dark, lbl))
                     return
                 if p == "weather":
                     self._send(200, "image/svg+xml; charset=utf-8", svg_weather(weather_series(), dark))
@@ -1200,6 +1228,8 @@ class Handler(BaseHTTPRequestHandler):
                                      cards.get("prev_values") if p == "month" else None,
                                      cards.get("prev_year") if p == "month" else None,
                                      dark))
+            elif u.path == "/api/heatmapmonths":
+                self._send(200, "application/json", json.dumps(heatmap_months()))
             elif u.path == "/api/years":
                 self._send(200, "application/json", json.dumps(available_years()))
             elif u.path == "/api/quality":
