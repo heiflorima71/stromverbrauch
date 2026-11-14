@@ -37,7 +37,7 @@ MODBUS_PORT = int(os.environ.get("MODBUS_PORT", "502"))
 MODBUS_UNIT = int(os.environ.get("MODBUS_UNIT", "1"))
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "60"))
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8080"))
-APP_VERSION = os.environ.get("APP_VERSION", "0.2.2")
+APP_VERSION = os.environ.get("APP_VERSION", "0.2.3")
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DB_PATH = os.path.join(DATA_DIR, "energy.db")
 DOUBLE_REG = int(os.environ.get("ENERGY_DOUBLE_REG", "6012"))   # double, 4 regs
@@ -461,10 +461,10 @@ def theme(dark):
     if dark:
         return {"bg": "#16181d", "grid": "#2a2d34", "txt": "#a8adb8", "title": "#e8eaf0",
                 "sub": "#7d828c", "bar": "#5aa2f0", "bar2": "#4a4f58", "val": "#c8ccd4",
-                "empty": "#232830", "c0": (35, 40, 48), "c1": (90, 162, 240)}
+                "empty": "#20242b", "c0": (35, 40, 48), "c1": (90, 162, 240)}
     return {"bg": "#ffffff", "grid": "#e6e6e6", "txt": "#666666", "title": "#222222",
             "sub": "#888888", "bar": "#2f7ed8", "bar2": "#c8ccd2", "val": "#333333",
-            "empty": "#f2f2f2", "c0": (235, 240, 250), "c1": (37, 99, 216)}
+            "empty": "#fafbfc", "c0": (235, 240, 250), "c1": (37, 99, 216)}
 
 
 # ---------------- Leistung (Lastgang) & Heatmap ----------------
@@ -569,11 +569,11 @@ def _full_days_by_hour(rows):
 
 
 def heatmap_months():
-    """Monate mit >=1 vollen (>=20 h) Tagen, neueste zuerst."""
+    """Alle Monate mit Messdaten, neueste zuerst."""
     con = db()
     rows = con.execute("SELECT ts, delta_wh FROM readings WHERE delta_wh IS NOT NULL AND delta_wh >= 0").fetchall()
     con.close()
-    return sorted({dt.strftime("%Y-%m") for dt, hs in _full_days_by_hour(rows).items() if len(hs) >= 20}, reverse=True)
+    return sorted({datetime.fromtimestamp(ts).strftime("%Y-%m") for ts, _ in rows}, reverse=True)
 
 
 def heatmap_series(ym="all"):
@@ -618,7 +618,7 @@ def svg_heatmap(grid, counts, dark=False, label="Ganzes Jahr"):
         b = int(th["c0"][2] + (th["c1"][2] - th["c0"][2]) * t)
         return f"#{r:02x}{g:02x}{b:02x}"
 
-    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" font-family="system-ui,Segoe UI,Arial" font-size="12">']
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" font-family="system-ui,Segoe UI,Arial" font-size="12" shape-rendering="crispEdges">']
     parts.append(f'<rect width="{W}" height="{H}" fill="{th["bg"]}"/>')
     nd = f" (Ø über {min(counts.values()) if counts else 0} volle Tage je Wochentag)" if counts else ""
     parts.append(f'<text x="{ml}" y="24" font-size="16" font-weight="600" fill="{th["title"]}">Wann verbraucht das Haus? kWh je Wochentag × Stunde · {html.escape(label)}{nd}</text>')
@@ -630,7 +630,7 @@ def svg_heatmap(grid, counts, dark=False, label="Ganzes Jahr"):
             v = grid[wd][h]
             x, y = ml + h * cw, mt + wd * ch
             fill = color(v) if v is not None else th["empty"]
-            parts.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{cw - 1:.1f}" height="{ch - 1:.1f}" fill="{fill}"/>')
+            parts.append(f'<rect x="{x:.2f}" y="{y:.2f}" width="{cw:.2f}" height="{ch:.2f}" fill="{fill}" stroke="{th["grid"]}" stroke-width="0.7"/>')
     for h in range(0, 24, 2):
         parts.append(f'<text x="{ml + h * cw + cw / 2:.1f}" y="{mt + ph + 16}" text-anchor="middle" fill="{th["txt"]}" font-size="10">{h:02d}</text>')
     parts.append(f'<text x="{ml + pw / 2:.0f}" y="{H - 6}" text-anchor="middle" fill="{th["sub"]}">Dunkelblau = hoher Verbrauch · Nachtspitzen können Poolpumpe/Gewächshaus (Frostschutz) sein</text>')
