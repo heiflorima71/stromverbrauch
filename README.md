@@ -31,7 +31,7 @@ ein **Stundenprofil** (heute vs. gestern vs. Ø der letzten X Tage) und ein
 
 ## Deployment (Olares)
 
-Image: `ghcr.io/heiflorima71/stromverbrauch:v0.2.1` (linux/amd64).
+Image: `ghcr.io/heiflorima71/stromverbrauch:v0.2.7` (linux/amd64).
 
 Konfiguration über die Olares-Installationsmaske:
 `MODBUS_HOST`, `MODBUS_PORT`, `MODBUS_UNIT`, `POLL_SECONDS`,
